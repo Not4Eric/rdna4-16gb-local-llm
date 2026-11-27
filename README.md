@@ -41,7 +41,7 @@ All hill-climb decode numbers are medians over a fixed 6-prompt panel (Python LR
 
 ### 1. Clone This Repository
 ```bash
-git clone <YOUR_REPO_URL> rdna4-16gb-local-llm
+git clone https://github.com/Not4Eric/rdna4-16gb-local-llm
 cd rdna4-16gb-local-llm
 ```
 
