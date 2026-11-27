@@ -1,0 +1,12 @@
+# Local downloads, builds, logs, and lock files
+models/
+build/
+vendor/
+logs/
+*.gguf
+*.log
+.gpu.lock
+__pycache__/
+*.pyc
+*-eq1.json
+*-eq2.json

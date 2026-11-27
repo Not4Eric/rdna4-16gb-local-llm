@@ -1,0 +1,2230 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 2a7b3a47d..f1fd4f443 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1331,8 +1331,8 @@ protected:
+         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
+     }
+ 
+-    // only LiliCorr uses this, to keep the context features for its scorer; the other heads only need the KV cache
+-    // called after the host copy injection of a chunk, while h_nextn still holds the context features of batch_inject
++    // LiliCorr and the Inkling2 DSpark keep context features from h_nextn; the other heads only need the KV cache
++    // called after the injection of a chunk, while h_nextn still holds the context features of batch_inject
+     virtual void store_context_features(llama_seq_id /*seq_id*/, int32_t /*n_chunk*/) {}
+ 
+ public:
+@@ -1478,6 +1478,7 @@ public:
+                                 __func__, rc, (int) n_chunk, (int) offset);
+                         return false;
+                     }
++                    store_context_features(seq_id, n_chunk);
+                     continue;
+                 }
+ 
+@@ -1607,6 +1608,19 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
+     // bonus anchor (SpecForge exports) when false: slot 0 is a bonus token, not a prediction slot
+     bool sample_from_anchor = true;
+ 
++    // the Markov head reads the context state of the last committed token (Inkling2 f_rnn)
++    // it comes back from the injection as h_nextn, kept for the last ctx_rows positions of each sequence
++    bool has_markov_context = false;
++    size_t ctx_rows = 0;
++    std::vector<float>     ctx_embd;
++    std::vector<llama_pos> ctx_pos;
++
++    // per-token state of the block tokens, n_embd_dec wide: the context state on the anchor row, [uniform | 1/temp] on the draft rows, see llama_batch_ext_select_n_embd_state
++    // with probabilistic drafting the graph draws each block token from it and returns [token, k, ids, probs] in h_nextn
++    std::vector<float>        block_state;
++    std::vector<std::mt19937> draw_rng;
++    std::vector<int64_t>      draw_seed; // the seed each generator was last seeded with (-1: reseed)
++
+     common_speculative_impl_draft_dspark(const common_params_speculative & params, uint32_t n_seq)
+         : common_speculative_impl_draft_dflash(params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)
+     {
+@@ -1617,6 +1631,18 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
+             if (llama_model_meta_val_str(model_dft, "dflash.sample_from_anchor", buf, sizeof(buf)) >= 0) {
+                 sample_from_anchor = std::strcmp(buf, "true") == 0;
+             }
++            if (llama_model_meta_val_str(model_dft, "dflash.has_markov_context", buf, sizeof(buf)) >= 0) {
++                has_markov_context = std::strcmp(buf, "true") == 0;
++            }
++        }
++
++        if (has_markov_context) {
++            ctx_rows = (size_t) block_size + 1;
++            ctx_embd.resize((size_t) n_seq * ctx_rows * (size_t) n_embd_dec);
++            ctx_pos.assign((size_t) n_seq * ctx_rows, -1);
++            block_state.reserve((size_t) n_seq * block_size * n_embd_dec);
++            draw_rng.resize(n_seq);
++            draw_seed.assign(n_seq, -1);
+         }
+ 
+         if (this->params.p_min > 0.0f) {
+@@ -1629,17 +1655,59 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
+             }
+         }
+ 
+-        LOG_INF("%s: - sample_from_anchor=%s\n", __func__, sample_from_anchor ? "true" : "false");
++        LOG_INF("%s: - sample_from_anchor=%s, has_markov_context=%s\n", __func__,
++                sample_from_anchor ? "true" : "false", has_markov_context ? "true" : "false");
+ 
+         // anchor-first DSpark yields a full block_size draft tokens
++        // the context state is read back from h_nextn at every injected row
+         init({
+             /* .n_draft_max      = */ sample_from_anchor ? block_size : block_size - 1,
+             /* .backend_sampling = */ true,
+             /* .dev_features     = */ true,
+-            /* .nextn_masked     = */ true,
++            /* .nextn_masked     = */ !has_markov_context,
+         });
+     }
+ 
++protected:
++    void store_context_features(llama_seq_id seq_id, int32_t n_chunk) override {
++        if (!has_markov_context) {
++            return;
++        }
++        const float * state = llama_get_embeddings_nextn(params.ctx_dft);
++        if (!state) {
++            return;
++        }
++        const llama_pos pos_min = std::max(0, batch_inject.tokens.back().pos[0] - block_size);
++        for (int32_t i = 0; i < n_chunk; ++i) {
++            const llama_pos pos = batch_inject.tokens[i].pos[0];
++            if (pos < pos_min) {
++                continue;
++            }
++            const size_t slot = (size_t) seq_id * ctx_rows + (size_t) pos % ctx_rows;
++            std::memcpy(ctx_embd.data() + slot * (size_t) n_embd_dec, state + (size_t) i * n_embd_dec, (size_t) n_embd_dec * sizeof(float));
++            ctx_pos[slot] = pos;
++        }
++    }
++
++    // context state of the token before the block, nullptr if it was not injected
++    const float * get_context_state(llama_seq_id seq_id, llama_pos pos) const {
++        if (pos < 0) {
++            return nullptr;
++        }
++        const size_t slot = (size_t) seq_id * ctx_rows + (size_t) pos % ctx_rows;
++        return ctx_pos[slot] == pos ? ctx_embd.data() + slot * (size_t) n_embd_dec : nullptr;
++    }
++
++public:
++    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
++        // the markov context draws: reseed per request rather than per round, or two identical requests differ
++        if (has_markov_context && seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
++            draw_seed[seq_id] = -1;
++        }
++
++        common_speculative_impl_draft_dflash::begin(seq_id, prompt);
++    }
++
+     void draft(common_speculative_draft_params_vec & dparams) override {
+         auto & ctx_dft = params.ctx_dft;
+ 
+@@ -1649,6 +1717,9 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
+         // record where each block starts and its size
+         std::vector<int32_t> i_block_beg(n_seq, -1);
+         std::vector<int32_t> n_block    (n_seq,  0);
++        std::vector<bool>    sampled    (n_seq,  false);
++
++        block_state.clear();
+ 
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+             auto & dp = dparams[seq_id];
+@@ -1656,16 +1727,53 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
+                 continue;
+             }
+ 
++            // the Markov head reads the context state of the token before the block, no draft without it
++            const float * state = has_markov_context ? get_context_state(seq_id, dp.pos0 - 1) : nullptr;
++            if (has_markov_context && !state) {
++                continue;
++            }
++
++            // the graph draws the block at the target's temperature, the verifier then does rejection sampling with q
++            sampled[seq_id] = has_markov_context && params.probabilistic && dp.result_q && dp.temp > 0.0f;
++            if (sampled[seq_id] && draw_seed[seq_id] != dp.seed) {
++                draw_seed[seq_id] = dp.seed;
++                // the default seed means random; mixed so it differs from the target's, as in spec_retune
++                draw_rng[seq_id].seed(dp.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : dp.seed ^ 0x85ebca6bu);
++            }
++
+             common_sampler_reset(smpls[seq_id].get());
+ 
+             const int32_t n = (int32_t) dp.pos0;
+ 
+             const int32_t n_draft = params.n_max;
+             const int32_t n_block_tokens = n_draft + (sample_from_anchor ? 0 : 1);
++
++            // all blocks share one decode: a block that does not fit in the draft context fails every sequence's draft
++            if ((uint64_t) dp.pos0 + n_block_tokens > llama_n_ctx_seq(ctx_dft)) {
++                continue;
++            }
++
+             i_block_beg[seq_id] = batch.size();
+             n_block    [seq_id] = n_block_tokens;
+             for (int32_t i = 0; i < n_block_tokens; ++i) {
+-                batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, true);
++                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, true);
++                if (state) {
++                    // reserved up front, so the views of the earlier tokens stay valid
++                    GGML_ASSERT(block_state.size() + n_embd_dec <= block_state.capacity());
++                    float * row = block_state.data() + block_state.size();
++                    if (i == 0) {
++                        block_state.insert(block_state.end(), state, state + n_embd_dec);
++                    } else {
++                        block_state.resize(block_state.size() + n_embd_dec, 0.0f);
++                        if (sampled[seq_id]) {
++                            // u in [0, 1): a draw in double can round up to 1 in float
++                            const float u = (float) std::uniform_real_distribution<double>(0.0, 1.0)(draw_rng[seq_id]);
++                            row[0] = std::min(u, std::nextafter(1.0f, 0.0f));
++                            row[1] = 1.0f / dp.temp;
++                        }
++                    }
++                    batch.set_embd_state(idx, { row, 1, (size_t) n_embd_dec });
++                }
+             }
+         }
+ 
+@@ -1693,10 +1801,34 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
+ 
+             auto & result = *dp.result;
+ 
+-            // DSpark: read from the first draft slot, truncate below the confidence threshold
+-            const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+             // bonus-anchor drafts read the mask positions only, like DFlash
+             const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
++
++            if (sampled[seq_id]) {
++                // the tokens the graph drew, and the distribution q each one was drawn from
++                const float * draws = llama_get_embeddings_nextn(ctx_dft);
++                GGML_ASSERT(draws && "DSpark draws missing from h_nextn");
++                for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
++                    const float * row = draws + (size_t) (beg + i) * n_embd_dec;
++                    const int32_t n_cand = (int32_t) row[1];
++
++                    auto & q = dp.result_q->emplace_back();
++                    q.reserve(n_cand);
++                    for (int32_t k = 0; k < n_cand; ++k) {
++                        const float p = row[2 + n_cand + k];
++                        q.push_back({ (llama_token) row[2 + k], std::log(p), p });
++                    }
++                    result.push_back((llama_token) row[0]);
++                }
++                if (result.size() < (size_t) params.n_min) {
++                    result.clear();
++                    dp.result_q->clear();
++                }
++                continue;
++            }
++
++            // DSpark: read from the first draft slot, truncate below the confidence threshold
++            const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+             for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
+                 const int32_t idx = beg + i;
+ 
+diff --git a/conversion/__init__.py b/conversion/__init__.py
+index 253a18fd4..8869b7252 100644
+--- a/conversion/__init__.py
++++ b/conversion/__init__.py
+@@ -148,7 +148,9 @@ TEXT_MODEL_MAP: dict[str, str] = {
+     "HYV4ForCausalLM": "hy_v4",
+     "IQuestCoderForCausalLM": "llama",
+     "Inkling2ForCausalLM": "inkling2",
++    "Inkling2LoopForCausalLM": "inkling2",
+     "Inkling2ForConditionalGeneration": "inkling2",
++    "Inkling2LoopForConditionalGeneration": "inkling2",
+     "InternLM2ForCausalLM": "internlm",
+     "InternLM3ForCausalLM": "internlm",
+     "JAISLMHeadModel": "jais",
+@@ -389,6 +391,7 @@ MMPROJ_MODEL_MAP: dict[str, str] = {
+     "HunYuanVLForConditionalGeneration": "hunyuan",
+     "Idefics3ForConditionalGeneration": "smolvlm",
+     "Inkling2ForConditionalGeneration": "inkling2",
++    "Inkling2LoopForConditionalGeneration": "inkling2",
+     "InternVisionModel": "internvl",
+     "JanusForConditionalGeneration": "januspro",
+     "KimiK25ForConditionalGeneration": "kimivl",
+diff --git a/conversion/inkling2.py b/conversion/inkling2.py
+index a8e8b892e..16f030619 100644
+--- a/conversion/inkling2.py
++++ b/conversion/inkling2.py
+@@ -69,7 +69,7 @@ def _is_inkling2(dir_model: Path) -> bool:
+     if not (dir_model / "config.json").is_file():
+         return False
+     with open(dir_model / "config.json", encoding="utf-8") as f:
+-        return json.load(f).get("model_type") in ("inkling2", "inkling2_text")
++        return json.load(f).get("model_type") in ("inkling2", "inkling2_text", "inkling2_loop", "inkling2_loop_text")
+ 
+ 
+ @ModelBase.register_hparams_loader(_is_inkling2)
+@@ -274,7 +274,229 @@ class Inkling2Model(TextModel):
+             yield from super().modify_tensors(data_torch, name, bid)
+ 
+ 
+-@ModelBase.register("Inkling2ForConditionalGeneration")
++@ModelBase.register("Inkling2LoopForConditionalGeneration", "Inkling2LoopForCausalLM")
++class Inkling2LoopModel(Inkling2Model):
++    model_arch = gguf.MODEL_ARCH.INKLING2_LOOP
++
++    # raw checkpoint and transformers names of the cross-pass message queries
++    _query_kinds = {
++        "model.middle_cycle_cross_pass_queries": "q",
++        "model.middle_cycle_cross_pass_kv_queries": "kv",
++        "model.cross_pass_messages.queries": "q",
++        "model.cross_pass_messages.kv_queries": "kv",
++    }
++
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self._queries: dict[str, Tensor] = {}
++        self.loop = self.hparams["loop_config"]
++        if set(self.loop) != {"core_start", "core_end", "num_passes", "gate_rank", "is_varloop"}:
++            raise ValueError(f"Inkling2Loop: unsupported loop_config keys {sorted(self.loop)}")
++        start, end, block = self.loop["core_start"], self.loop["core_end"], self.hparams["n_layers_per_attn_res_block"]
++        # a fixed loop needs at least 2 passes, a variable loop at least 1
++        min_passes = 1 if self.loop["is_varloop"] else 2
++        if not 0 < start < end <= self.block_count or start % block or end % block or self.loop["num_passes"] < min_passes or self.loop["gate_rank"] < 1:
++            raise ValueError(f"Inkling2Loop: invalid loop_config {self.loop}")
++
++    def set_gguf_parameters(self):
++        super().set_gguf_parameters()
++        self.gguf_writer.add_loop_start(self.loop["core_start"])
++        self.gguf_writer.add_loop_end(self.loop["core_end"])
++        self.gguf_writer.add_loop_count(self.loop["num_passes"])
++        self.gguf_writer.add_loop_gate_rank(self.loop["gate_rank"])
++        self.gguf_writer.add_loop_varying(self.loop["is_varloop"])
++
++    def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
++        # the reference does not quantize the loop tensors
++        if new_name.endswith(("loop_msg_query.weight", "_ctrl_down.weight", "_ctrl_gain.weight", "_ctrl_forget.weight")):
++            return gguf.GGMLQuantizationType.F32
++        return super().tensor_force_quant(name, new_name, bid, n_dims)
++
++    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
++        if name not in self._query_kinds:
++            yield from super().modify_tensors(data_torch, name, bid)
++            return
++        self._queries[self._query_kinds[name]] = data_torch
++        if len(self._queries) < 2:
++            return
++        q, kv = self._queries["q"], self._queries["kv"]
++        start = self.loop["core_start"]
++        if q.shape[0] != 2 * (self.loop["core_end"] - start) or kv.shape != q.shape:
++            raise ValueError(f"Inkling2Loop: cross-pass queries {tuple(q.shape)} and {tuple(kv.shape)} do not match the loop core")
++        # core layer start + i mixes its q, k, v and mlp messages with these four queries
++        for i in range(q.shape[0] // 2):
++            query = torch.stack([q[2 * i], kv[2 * i], kv[2 * i + 1], q[2 * i + 1]])
++            yield self.format_tensor_name(gguf.MODEL_TENSOR.LOOP_MSG_QUERY, start + i, ".weight"), query
++
++
++def _fold_markov_chunk(unembed: Callable[[], Tensor], weight: Tensor | None, bias: Tensor | None, rows: slice) -> np.ndarray:
++    head = LazyTorchTensor.to_eager(unembed()[rows]).double()
++    out = head @ weight if weight is not None else head @ bias
++    return out.float().numpy()
++
++
++class Inkling2DSparkModel(Inkling2Model):
++    """Inkling2 DSpark draft (mtp.safetensors) as a DFLASH GGUF, export with --dspark"""
++    model_arch = gguf.MODEL_ARCH.DFLASH
++
++    _TARGET = {
++        "model.llm.unembed.weight": "target.unembed",
++        "model.language_model.unembed.weight": "target.unembed",
++        "lm_head.weight": "target.unembed",
++        "model.llm.embed_norm.weight": "target.embed_norm",
++        "model.language_model.embed_norm.weight": "target.embed_norm",
++        "model.language_model.embed_tokens.embed_norm.weight": "target.embed_norm",
++    }
++
++    _LAYER = {
++        "self_attn.k_proj_ctx.weight": gguf.MODEL_TENSOR.DFLASH_ATTN_K_CTX,
++        "self_attn.v_proj_ctx.weight": gguf.MODEL_TENSOR.DFLASH_ATTN_V_CTX,
++        "self_attn.k_norm_ctx.weight": gguf.MODEL_TENSOR.DFLASH_ATTN_K_CTX_NORM,
++        "dflare_norm.weight":          gguf.MODEL_TENSOR.DFLASH_CTX_NORM,
++    }
++
++    _ROOT = {
++        "target.embed_norm":                gguf.MODEL_TENSOR.TOKEN_EMBD_NORM,
++        "mtp.norm.weight":                  gguf.MODEL_TENSOR.OUTPUT_NORM,
++        "mtp.markov_head.markov_w1.weight": gguf.MODEL_TENSOR.DSPARK_MARKOV_W1,
++        "mtp.markov_head.rnn_proj.weight":  gguf.MODEL_TENSOR.DSPARK_JOINT_PROJ,
++        "mtp.markov_head.rnn_proj.bias":    gguf.MODEL_TENSOR.DSPARK_JOINT_PROJ,
++        "mtp.markov_head.dflare_norm.weight": gguf.MODEL_TENSOR.DSPARK_MARKOV_CTX_NORM,
++    }
++
++    def __init__(self, *args, **kwargs):
++        self._folded: dict[str, gguf.LazyChunkedTensor] = {}
++        super().__init__(*args, **kwargs)
++        hp = self.hparams
++        mtp = hp.get("mtp_config")
++        if not mtp:
++            raise ValueError("Inkling2 DSpark export needs the mtp_config")
++        if mtp.get("markov_head_type") != "rnn_hidden" or mtp.get("q_bias") or mtp.get("o_bias") or mtp["hidden_size"] != hp["hidden_size"]:
++            raise ValueError(f"Inkling2 DSpark: unsupported mtp_config {mtp}")
++        # ids count loop passes, the last id is the final norm output
++        n_visits = self.block_count
++        if (loop := hp.get("loop_config")) is not None:
++            n_visits += (loop["num_passes"] - 1) * (loop["core_end"] - loop["core_start"])
++        targets = mtp["target_layer_ids"]
++        if len(targets) < 2 or targets != sorted(set(targets)) or targets[-1] != n_visits:
++            raise ValueError(f"Inkling2 DSpark: target_layer_ids {targets} must be sorted and end at {n_visits}")
++        self.mtp = mtp
++        self.block_count = mtp["num_hidden_layers"]
++        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
++
++    def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
++        if remote_hf_model_id is not None:
++            raise NotImplementedError("Inkling2 DSpark export needs a local checkpoint")
++        # mtp.safetensors is not in the weight map, unembed and embed_norm come from the target
++        tensors = self.index_local_tensors("mtp")
++        tensors.update(self.index_local_tensors("model"))
++        return tensors
++
++    @classmethod
++    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
++        name, gen = item
++        if name in cls._TARGET:
++            return cls._TARGET[name], gen
++        if name.startswith(("model.", "lm_head.")):
++            return None
++        if name.startswith("layers."):
++            return f"model.{name}", gen
++        return f"mtp.{name}", gen
++
++    def dequant_model(self):
++        super().dequant_model()
++        if "target.unembed" not in self.model_tensors:
++            raise ValueError("Inkling2 DSpark: missing the target unembed")
++        unembed = self.model_tensors.pop("target.unembed")
++        weight = LazyTorchTensor.to_eager(self.model_tensors.pop("mtp.markov_head.hidden_out.weight")()).double()
++        bias = LazyTorchTensor.to_eager(self.model_tensors.pop("mtp.markov_head.hidden_out.bias")()).double()
++        n_vocab, n_embd = unembed().shape
++        if weight.shape[0] != n_embd or bias.shape != (n_embd,):
++            raise ValueError(f"Inkling2 DSpark: hidden_out {tuple(weight.shape)} does not match unembed {(n_vocab, n_embd)}")
++        # markov_w2 = unembed @ hidden_out, fp64 like vLLM, one row chunk at a time
++        # padded tokens are never sampled, so keep only the tokenizer rows
++        n_vocab = self.hparams["unpadded_vocab_size"]
++        row_chunks = [slice(i, min(i + 4096, n_vocab)) for i in range(0, n_vocab, 4096)]
++        for name, w, b, shape in (
++            ("mtp.markov_head.fold.weight", weight, None, (n_vocab, weight.shape[1])),
++            ("mtp.markov_head.fold.bias", None, bias, (n_vocab,)),
++        ):
++            self._folded[name] = gguf.LazyChunkedTensor([partial(_fold_markov_chunk, unembed, w, b, r) for r in row_chunks], shape, np.float32)
++            self.model_tensors[name] = lambda shape=shape: torch.empty(shape, dtype=torch.float32, device="meta")
++
++    def prepare_metadata(self, vocab_only: bool):
++        from_dir = self.fname_out.is_dir()
++        super().prepare_metadata(vocab_only=vocab_only)
++        if from_dir:
++            self.fname_out = self.fname_out.parent / f"dspark-{self.fname_out.name}"
++
++    def set_vocab(self):
++        super().set_vocab()
++        # block uses mask_embd, mask token id is not used
++        self.gguf_writer.add_mask_token_id(0)
++
++    def set_gguf_parameters(self):
++        hp, mtp = self.hparams, self.mtp
++        n = self.block_count
++        w = self.gguf_writer
++        w.add_block_count(n)
++        w.add_context_length(mtp["max_position_embeddings"])
++        w.add_embedding_length(mtp["hidden_size"])
++        w.add_feed_forward_length(mtp["intermediate_size"])
++        w.add_head_count(mtp["num_attention_heads"])
++        w.add_head_count_kv(mtp["num_key_value_heads"])
++        w.add_key_length(mtp["head_dim"])
++        w.add_value_length(mtp["head_dim"])
++        w.add_rope_dimension_count(mtp["head_dim"])
++        w.add_rope_freq_base(float(mtp["rope_theta"]))
++        w.add_layer_norm_rms_eps(mtp["rms_norm_eps"])
++        # the block sees W positions before the anchor, llama.cpp SWA sees n_swa - 1
++        w.add_sliding_window(mtp["sliding_window_size"] + 1)
++        w.add_sliding_window_pattern([i in mtp["local_layer_ids"] for i in range(n)])
++        w.add_final_logit_softcapping(hp["final_logit_softcapping"])
++        w.add_block_size(mtp["block_size"])
++        w.add_target_layers(mtp["target_layer_ids"])
++        # slot 0 is the anchor, it does not predict a token
++        w.add_sample_from_anchor(False)
++        w.add_has_confidence_head(False)
++        w.add_has_markov_context(mtp["markov_head_type"] == "rnn_hidden")
++        w.add_file_type(self.ftype)
++
++    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
++        if name in self._folded:
++            suffix = ".bias" if name.endswith(".bias") else ".weight"
++            yield self.format_tensor_name(gguf.MODEL_TENSOR.DSPARK_MARKOV_W2, None, suffix), cast("Tensor", self._folded[name])
++            return
++        if name == "mtp.markov_head.markov_w1.weight":
++            data_torch = data_torch[:self.hparams["unpadded_vocab_size"]]
++        if name in self._ROOT:
++            suffix = ".bias" if name.endswith(".bias") else ".weight"
++            yield self.format_tensor_name(self._ROOT[name], None, suffix), data_torch
++            return
++        if name == "mtp.fuse_weight":
++            if tuple(data_torch.shape) != (self.block_count + 1, len(self.mtp["target_layer_ids"])):
++                raise ValueError(f"Inkling2 DSpark: unexpected fuse_weight shape {tuple(data_torch.shape)}")
++            # one row per draft layer, the last row is for the markov head
++            alpha = torch.softmax(data_torch.float(), dim=-1)
++            for i in range(self.block_count):
++                yield self.format_tensor_name(gguf.MODEL_TENSOR.DFLASH_CTX_MIX, i), alpha[i]
++            yield self.format_tensor_name(gguf.MODEL_TENSOR.DSPARK_MARKOV_CTX_MIX), alpha[-1]
++            return
++        if name == "mtp.mask_embed":
++            # copy the one mask embedding to each mask slot
++            yield self.format_tensor_name(gguf.MODEL_TENSOR.DSPARK_MASK_EMBD), data_torch.unsqueeze(0).expand(self.mtp["block_size"] - 1, -1).contiguous()
++            return
++        if name.startswith("mtp."):
++            raise ValueError(f"Inkling2 DSpark: unexpected tensor {name!r}")
++        assert bid is not None
++        key = name.removeprefix(f"model.layers.{bid}.")
++        if key in self._LAYER:
++            yield self.format_tensor_name(self._LAYER[key], bid), data_torch
++            return
++        yield from TextModel.modify_tensors(self, data_torch, name, bid)
++
++
++@ModelBase.register("Inkling2ForConditionalGeneration", "Inkling2LoopForConditionalGeneration")
+ class Inkling2VisionModel(MmprojModel):
+     def get_vision_config(self):
+         config = self.global_config.get("vision_config")
+diff --git a/docs/speculative.md b/docs/speculative.md
+index e6e428689..84ca366cf 100644
+--- a/docs/speculative.md
++++ b/docs/speculative.md
+@@ -132,6 +132,20 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DSpark.gguf \
+ acceptance (from the draft's confidence head) falls below `P` (default 0 = disabled).
+ Values above 0 require a draft with a confidence head.
+ 
++Inkling 2 ships its DSpark drafter as `mtp.safetensors` in the model directory. Export it from a local
++checkpoint with `--dspark`; the converter also reads the target's lm head and embedding norm from there:
++
++```bash
++python convert_hf_to_gguf.py /path/to/Inkling-2-Mini --dspark --outtype bf16 --outfile Inkling-2-Mini-DSpark.gguf
++
++llama-server -m Inkling-2-Mini.gguf -md Inkling-2-Mini-DSpark.gguf \
++    --spec-type draft-dspark --spec-draft-n-max 3 -fa on --jinja
++```
++
++The Inkling 2 drafter supports `--spec-draft-sampling probabilistic`:
++at a positive request temperature, each drawn token conditions the next one, and the target verifies the draft by
++rejection sampling.
++
+ Currently only drafts with a Qwen3 backbone are supported; support for other backbones
+ (e.g. Gemma4) is planned.
+ 
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+index f36566a81..5b52d98b0 100644
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -177,6 +177,7 @@ class Keys:
+         SELECTOR_TOP_K                    = "{arch}.selector_top_k"
+         SAMPLE_FROM_ANCHOR                = "{arch}.sample_from_anchor"
+         HAS_CONFIDENCE_HEAD               = "{arch}.has_confidence_head"
++        HAS_MARKOV_CONTEXT                = "{arch}.has_markov_context"
+         NORM_BEFORE_RESIDUAL              = "{arch}.norm_before_residual"
+         NORM_BEFORE_FC                    = "{arch}.norm_before_fc"
+         REALTIME_DELAY_TOKENS             = "{arch}.realtime_delay_tokens"
+@@ -326,6 +327,13 @@ class Keys:
+         L_CYCLES         = "{arch}.hrm.l_cycles"
+         PREFIX_LM        = "{arch}.hrm.prefix_lm"
+ 
++    class Loop:
++        START     = "{arch}.loop.start"
++        END       = "{arch}.loop.end"
++        COUNT     = "{arch}.loop.count"
++        GATE_RANK = "{arch}.loop.gate_rank"
++        VARYING   = "{arch}.loop.varying"
++
+     class Metis:
+         PASS_COUNT               = "{arch}.metis.pass_count"
+         MEMORY_LENGTH            = "{arch}.metis.memory_length"
+@@ -778,6 +786,7 @@ class MODEL_ARCH(IntEnum):
+     KOLIBRI1         = auto()
+     LIMITE           = auto()
+     INKLING2         = auto()
++    INKLING2_LOOP    = auto()
+     DOMYN_EDGE       = auto()
+ 
+ 
+@@ -880,6 +889,19 @@ class MODEL_TENSOR(IntEnum):
+     MOE_LATENT_UP        = auto() # nemotron 3 super
+     FFN_POST_CONV        = auto()
+     FFN_RES_QUERY        = auto()
++    LOOP_MSG_QUERY       = auto()
++    LOOP_Q_CTRL_DOWN     = auto()
++    LOOP_Q_CTRL_GAIN     = auto()
++    LOOP_Q_CTRL_FORGET   = auto()
++    LOOP_K_CTRL_DOWN     = auto()
++    LOOP_K_CTRL_GAIN     = auto()
++    LOOP_K_CTRL_FORGET   = auto()
++    LOOP_V_CTRL_DOWN     = auto()
++    LOOP_V_CTRL_GAIN     = auto()
++    LOOP_V_CTRL_FORGET   = auto()
++    LOOP_FFN_CTRL_DOWN   = auto()
++    LOOP_FFN_CTRL_GAIN   = auto()
++    LOOP_FFN_CTRL_FORGET = auto()
+     STREAM_EMBD          = auto()
+     DEPTH_MEM_STATE_WRITE = auto()
+     DEPTH_MEM_META_WRITE = auto()
+@@ -1779,6 +1801,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
+     MODEL_ARCH.KOLIBRI1:         "kolibri1",
+     MODEL_ARCH.LIMITE:           "limite",
+     MODEL_ARCH.INKLING2:         "inkling2",
++    MODEL_ARCH.INKLING2_LOOP:    "inkling2_loop",
+     MODEL_ARCH.DOMYN_EDGE:       "domynedge",
+ }
+ 
+@@ -1881,6 +1904,19 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
+     MODEL_TENSOR.MOE_LATENT_UP:             "blk.{bid}.ffn_latent_up",        # nemotron 3 super
+     MODEL_TENSOR.FFN_POST_CONV:             "blk.{bid}.ffn_post_conv",
+     MODEL_TENSOR.FFN_RES_QUERY:             "blk.{bid}.ffn_res_query",
++    MODEL_TENSOR.LOOP_MSG_QUERY:            "blk.{bid}.loop_msg_query",
++    MODEL_TENSOR.LOOP_Q_CTRL_DOWN:          "blk.{bid}.loop_q_ctrl_down",
++    MODEL_TENSOR.LOOP_Q_CTRL_GAIN:          "blk.{bid}.loop_q_ctrl_gain",
++    MODEL_TENSOR.LOOP_Q_CTRL_FORGET:        "blk.{bid}.loop_q_ctrl_forget",
++    MODEL_TENSOR.LOOP_K_CTRL_DOWN:          "blk.{bid}.loop_k_ctrl_down",
++    MODEL_TENSOR.LOOP_K_CTRL_GAIN:          "blk.{bid}.loop_k_ctrl_gain",
++    MODEL_TENSOR.LOOP_K_CTRL_FORGET:        "blk.{bid}.loop_k_ctrl_forget",
++    MODEL_TENSOR.LOOP_V_CTRL_DOWN:          "blk.{bid}.loop_v_ctrl_down",
++    MODEL_TENSOR.LOOP_V_CTRL_GAIN:          "blk.{bid}.loop_v_ctrl_gain",
++    MODEL_TENSOR.LOOP_V_CTRL_FORGET:        "blk.{bid}.loop_v_ctrl_forget",
++    MODEL_TENSOR.LOOP_FFN_CTRL_DOWN:        "blk.{bid}.loop_ffn_ctrl_down",
++    MODEL_TENSOR.LOOP_FFN_CTRL_GAIN:        "blk.{bid}.loop_ffn_ctrl_gain",
++    MODEL_TENSOR.LOOP_FFN_CTRL_FORGET:      "blk.{bid}.loop_ffn_ctrl_forget",
+     MODEL_TENSOR.STREAM_EMBD:               "stream_embd",
+     MODEL_TENSOR.DEPTH_MEM_STATE_WRITE:     "depth_mem_state_write",
+     MODEL_TENSOR.DEPTH_MEM_META_WRITE:      "depth_mem_meta_write",
+@@ -7087,6 +7123,55 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
+         MODEL_TENSOR.FFN_POST_CONV,
+         MODEL_TENSOR.FFN_RES_QUERY,
+     ],
++    MODEL_ARCH.INKLING2_LOOP: [
++        MODEL_TENSOR.TOKEN_EMBD,
++        MODEL_TENSOR.TOKEN_EMBD_NORM,
++        MODEL_TENSOR.OUTPUT,
++        MODEL_TENSOR.OUTPUT_NORM,
++        MODEL_TENSOR.OUTPUT_RES_QUERY,
++        MODEL_TENSOR.ATTN_NORM,
++        MODEL_TENSOR.ATTN_Q,
++        MODEL_TENSOR.ATTN_K,
++        MODEL_TENSOR.ATTN_V,
++        MODEL_TENSOR.ATTN_OUT,
++        MODEL_TENSOR.ATTN_GATE,
++        MODEL_TENSOR.ATTN_REL,
++        MODEL_TENSOR.ATTN_REL_BIAS,
++        MODEL_TENSOR.ATTN_Q_CLIP,
++        MODEL_TENSOR.ATTN_REL_CLIP,
++        MODEL_TENSOR.ATTN_SINK_PROJ,
++        MODEL_TENSOR.ATTN_Q_INP_NORM,
++        MODEL_TENSOR.ATTN_K_INP_NORM,
++        MODEL_TENSOR.ATTN_V_INP_NORM,
++        MODEL_TENSOR.ATTN_K_CONV,
++        MODEL_TENSOR.ATTN_V_CONV,
++        MODEL_TENSOR.ATTN_K_CONV_PROJ,
++        MODEL_TENSOR.ATTN_V_CONV_PROJ,
++        MODEL_TENSOR.ATTN_POST_CONV,
++        MODEL_TENSOR.ATTN_RES_QUERY,
++        MODEL_TENSOR.FFN_NORM,
++        MODEL_TENSOR.FFN_GATE_INP,
++        MODEL_TENSOR.FFN_EXP_PROBS_B,
++        MODEL_TENSOR.FFN_GATE_EXP,
++        MODEL_TENSOR.FFN_UP_EXP,
++        MODEL_TENSOR.FFN_GATE_UP_EXP,
++        MODEL_TENSOR.FFN_DOWN_EXP,
++        MODEL_TENSOR.FFN_POST_CONV,
++        MODEL_TENSOR.FFN_RES_QUERY,
++        MODEL_TENSOR.LOOP_MSG_QUERY,
++        MODEL_TENSOR.LOOP_Q_CTRL_DOWN,
++        MODEL_TENSOR.LOOP_Q_CTRL_GAIN,
++        MODEL_TENSOR.LOOP_Q_CTRL_FORGET,
++        MODEL_TENSOR.LOOP_K_CTRL_DOWN,
++        MODEL_TENSOR.LOOP_K_CTRL_GAIN,
++        MODEL_TENSOR.LOOP_K_CTRL_FORGET,
++        MODEL_TENSOR.LOOP_V_CTRL_DOWN,
++        MODEL_TENSOR.LOOP_V_CTRL_GAIN,
++        MODEL_TENSOR.LOOP_V_CTRL_FORGET,
++        MODEL_TENSOR.LOOP_FFN_CTRL_DOWN,
++        MODEL_TENSOR.LOOP_FFN_CTRL_GAIN,
++        MODEL_TENSOR.LOOP_FFN_CTRL_FORGET,
++    ],
+     MODEL_ARCH.DOMYN_EDGE: [
+         MODEL_TENSOR.TOKEN_EMBD,
+         MODEL_TENSOR.ATTN_Q,
+diff --git a/gguf-py/gguf/gguf_writer.py b/gguf-py/gguf/gguf_writer.py
+index eb0bd91d0..900aef614 100644
+--- a/gguf-py/gguf/gguf_writer.py
++++ b/gguf-py/gguf/gguf_writer.py
+@@ -990,6 +990,21 @@ class GGUFWriter:
+     def add_hrm_prefix_lm(self, value: bool) -> None:
+         self.add_bool(Keys.HRM.PREFIX_LM.format(arch=self.arch), value)
+ 
++    def add_loop_start(self, value: int) -> None:
++        self.add_uint32(Keys.Loop.START.format(arch=self.arch), value)
++
++    def add_loop_end(self, value: int) -> None:
++        self.add_uint32(Keys.Loop.END.format(arch=self.arch), value)
++
++    def add_loop_count(self, value: int) -> None:
++        self.add_uint32(Keys.Loop.COUNT.format(arch=self.arch), value)
++
++    def add_loop_gate_rank(self, value: int) -> None:
++        self.add_uint32(Keys.Loop.GATE_RANK.format(arch=self.arch), value)
++
++    def add_loop_varying(self, value: bool) -> None:
++        self.add_bool(Keys.Loop.VARYING.format(arch=self.arch), value)
++
+     def add_metis_pass_count(self, value: int) -> None:
+         self.add_uint32(Keys.Metis.PASS_COUNT.format(arch=self.arch), value)
+ 
+@@ -1095,6 +1110,9 @@ class GGUFWriter:
+     def add_has_confidence_head(self, value: bool) -> None:
+         self.add_bool(Keys.LLM.HAS_CONFIDENCE_HEAD.format(arch=self.arch), value)
+ 
++    def add_has_markov_context(self, value: bool) -> None:
++        self.add_bool(Keys.LLM.HAS_MARKOV_CONTEXT.format(arch=self.arch), value)
++
+     def add_target_layers(self, value: Sequence[int]) -> None:
+         self.add_array(Keys.LLM.TARGET_LAYERS.format(arch=self.arch), value)
+ 
+diff --git a/gguf-py/gguf/tensor_mapping.py b/gguf-py/gguf/tensor_mapping.py
+index d48d46b9a..c0bbfde22 100644
+--- a/gguf-py/gguf/tensor_mapping.py
++++ b/gguf-py/gguf/tensor_mapping.py
+@@ -543,6 +543,66 @@ class TensorNameMap:
+             "model.layers.{bid}.attention_input.query",  # inkling2
+         ),
+ 
++        MODEL_TENSOR.LOOP_Q_CTRL_DOWN: (
++            "model.layers.{bid}.q_controller.down_proj",       # inkling2_loop
++            "model.layers.{bid}.controllers.attn.down_weight",  # inkling2_loop
++        ),
++
++        MODEL_TENSOR.LOOP_Q_CTRL_GAIN: (
++            "model.layers.{bid}.q_controller.gain_proj",       # inkling2_loop
++            "model.layers.{bid}.controllers.attn.gain_weight",  # inkling2_loop
++        ),
++
++        MODEL_TENSOR.LOOP_Q_CTRL_FORGET: (
++            "model.layers.{bid}.q_controller.forget_proj",       # inkling2_loop
++            "model.layers.{bid}.controllers.attn.forget_weight",  # inkling2_loop
++        ),
++
++        MODEL_TENSOR.LOOP_K_CTRL_DOWN: (
++            "model.layers.{bid}.k_controller.down_proj",    # inkling2_loop
++            "model.layers.{bid}.controllers.k.down_weight",  # inkling2_loop
++        ),
++
++        MODEL_TENSOR.LOOP_K_CTRL_GAIN: (
++            "model.layers.{bid}.k_controller.gain_proj",    # inkling2_loop
++            "model.layers.{bid}.controllers.k.gain_weight",  # inkling2_loop
++        ),
++
++        MODEL_TENSOR.LOOP_K_CTRL_FORGET: (
++            "model.layers.{bid}.k_controller.forget_proj",    # inkling2_loop
++            "model.layers.{bid}.controllers.k.forget_weight",  # inkling2_loop
++        ),
++
++        MODEL_TENSOR.LOOP_V_CTRL_DOWN: (
++            "model.layers.{bid}.v_controller.down_proj",    # inkling2_loop
++            "model.layers.{bid}.controllers.v.down_weight",  # inkling2_loop
++        ),
++
++        MODEL_TENSOR.LOOP_V_CTRL_GAIN: (
++            "model.layers.{bid}.v_controller.gain_proj",    # inkling2_loop
++            "model.layers.{bid}.controllers.v.gain_weight",  # inkling2_loop
++        ),
++
++        MODEL_TENSOR.LOOP_V_CTRL_FORGET: (
++            "model.layers.{bid}.v_controller.forget_proj",    # inkling2_loop
++            "model.layers.{bid}.controllers.v.forget_weight",  # inkling2_loop
++        ),
++
++        MODEL_TENSOR.LOOP_FFN_CTRL_DOWN: (
++            "model.layers.{bid}.mlp_controller.down_proj",    # inkling2_loop
++            "model.layers.{bid}.controllers.mlp.down_weight",  # inkling2_loop
++        ),
++
++        MODEL_TENSOR.LOOP_FFN_CTRL_GAIN: (
++            "model.layers.{bid}.mlp_controller.gain_proj",    # inkling2_loop
++            "model.layers.{bid}.controllers.mlp.gain_weight",  # inkling2_loop
++        ),
++
++        MODEL_TENSOR.LOOP_FFN_CTRL_FORGET: (
++            "model.layers.{bid}.mlp_controller.forget_proj",    # inkling2_loop
++            "model.layers.{bid}.controllers.mlp.forget_weight",  # inkling2_loop
++        ),
++
+         # Feed-forward norm
+         MODEL_TENSOR.FFN_NORM: (
+             "layers.{bid}.moe_connection.norm",                              # metis16
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index aa98ef377..9f0ba7e96 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -184,6 +184,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
+     { LLM_ARCH_KOLIBRI1,         "kolibri1"         },
+     { LLM_ARCH_RICURSIVE,        "ricursive"        },
+     { LLM_ARCH_INKLING2,         "inkling2"         },
++    { LLM_ARCH_INKLING2_LOOP,    "inkling2_loop"    },
+     { LLM_ARCH_DOMYN_EDGE,       "domynedge"        },
+     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
+ };
+@@ -285,6 +286,11 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
+     { LLM_KV_HRM_H_CYCLES,                      "%s.hrm.h_cycles"                      },
+     { LLM_KV_HRM_L_CYCLES,                      "%s.hrm.l_cycles"                      },
+     { LLM_KV_HRM_PREFIX_LM,                     "%s.hrm.prefix_lm"                     },
++    { LLM_KV_LOOP_START,                        "%s.loop.start"                        },
++    { LLM_KV_LOOP_END,                          "%s.loop.end"                          },
++    { LLM_KV_LOOP_COUNT,                        "%s.loop.count"                        },
++    { LLM_KV_LOOP_GATE_RANK,                    "%s.loop.gate_rank"                    },
++    { LLM_KV_LOOP_VARYING,                      "%s.loop.varying"                      },
+     { LLM_KV_METIS_PASS_COUNT,                  "%s.metis.pass_count"                  },
+     { LLM_KV_METIS_MEMORY_LENGTH,               "%s.metis.memory_length"               },
+     { LLM_KV_METIS_ROUTE_LENGTH,                "%s.metis.route_length"                },
+@@ -440,11 +446,12 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
+     { LLM_KV_NORM_BEFORE_RESIDUAL,  "%s.norm_before_residual" },
+     { LLM_KV_NORM_BEFORE_FC,        "%s.norm_before_fc"       },
+ 
+-    { LLM_KV_DFLASH_BLOCK_SIZE,       "%s.block_size"       },
+-    { LLM_KV_DFLASH_CONV_KERNEL_SIZE, "%s.conv_kernel_size" },
+-    { LLM_KV_DFLASH_CONV_GROUP_SIZE,  "%s.conv_group_size"  },
+-    { LLM_KV_DFLASH_SELECTOR_RANK,    "%s.selector_rank"    },
+-    { LLM_KV_DFLASH_SELECTOR_TOP_K,   "%s.selector_top_k"   },
++    { LLM_KV_DFLASH_BLOCK_SIZE,         "%s.block_size"         },
++    { LLM_KV_DFLASH_CONV_KERNEL_SIZE,   "%s.conv_kernel_size"   },
++    { LLM_KV_DFLASH_CONV_GROUP_SIZE,    "%s.conv_group_size"    },
++    { LLM_KV_DFLASH_SELECTOR_RANK,      "%s.selector_rank"      },
++    { LLM_KV_DFLASH_SELECTOR_TOP_K,     "%s.selector_top_k"     },
++    { LLM_KV_DFLASH_HAS_MARKOV_CONTEXT, "%s.has_markov_context" },
+ 
+     { LLM_KV_LILICORR_HIDDEN_SIZE,       "lilicorr.hidden_size"      },
+     { LLM_KV_LILICORR_CANDIDATE_TOPK,    "lilicorr.candidate_topk"   },
+@@ -591,6 +598,19 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+     { LLM_TENSOR_FFN_LATENT_UP,                          "blk.%d.ffn_latent_up" },
+     { LLM_TENSOR_FFN_POST_CONV,                          "blk.%d.ffn_post_conv" },
+     { LLM_TENSOR_FFN_RES_QUERY,                          "blk.%d.ffn_res_query" },
++    { LLM_TENSOR_LOOP_MSG_QUERY,                         "blk.%d.loop_msg_query" },
++    { LLM_TENSOR_LOOP_Q_CTRL_DOWN,                       "blk.%d.loop_q_ctrl_down" },
++    { LLM_TENSOR_LOOP_Q_CTRL_GAIN,                       "blk.%d.loop_q_ctrl_gain" },
++    { LLM_TENSOR_LOOP_Q_CTRL_FORGET,                     "blk.%d.loop_q_ctrl_forget" },
++    { LLM_TENSOR_LOOP_K_CTRL_DOWN,                       "blk.%d.loop_k_ctrl_down" },
++    { LLM_TENSOR_LOOP_K_CTRL_GAIN,                       "blk.%d.loop_k_ctrl_gain" },
++    { LLM_TENSOR_LOOP_K_CTRL_FORGET,                     "blk.%d.loop_k_ctrl_forget" },
++    { LLM_TENSOR_LOOP_V_CTRL_DOWN,                       "blk.%d.loop_v_ctrl_down" },
++    { LLM_TENSOR_LOOP_V_CTRL_GAIN,                       "blk.%d.loop_v_ctrl_gain" },
++    { LLM_TENSOR_LOOP_V_CTRL_FORGET,                     "blk.%d.loop_v_ctrl_forget" },
++    { LLM_TENSOR_LOOP_FFN_CTRL_DOWN,                     "blk.%d.loop_ffn_ctrl_down" },
++    { LLM_TENSOR_LOOP_FFN_CTRL_GAIN,                     "blk.%d.loop_ffn_ctrl_gain" },
++    { LLM_TENSOR_LOOP_FFN_CTRL_FORGET,                   "blk.%d.loop_ffn_ctrl_forget" },
+     { LLM_TENSOR_STREAM_EMBD,                            "stream_embd" },
+     { LLM_TENSOR_DEPTH_MEM_STATE_WRITE,                  "depth_mem_state_write" },
+     { LLM_TENSOR_DEPTH_MEM_META_WRITE,                   "depth_mem_meta_write" },
+@@ -893,6 +913,8 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+     { LLM_TENSOR_DSPARK_CONF_PROJ,                       "conf_proj" },
+     { LLM_TENSOR_DSPARK_JOINT_PROJ,                      "joint_proj" },
+     { LLM_TENSOR_DSPARK_MASK_EMBD,                       "mask_embd" },
++    { LLM_TENSOR_DSPARK_MARKOV_CTX_MIX,                  "markov_ctx_mix" },
++    { LLM_TENSOR_DSPARK_MARKOV_CTX_NORM,                 "markov_ctx_norm" },
+     { LLM_TENSOR_ENGRAM_KV,                              "blk.%d.engram_kv" },
+     { LLM_TENSOR_ENGRAM_GATE,                            "blk.%d.engram_gate" },
+     { LLM_TENSOR_DFLASH_ATTN_CONV_BASE,                  "blk.%d.attn_conv_base" },
+@@ -902,6 +924,11 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+     { LLM_TENSOR_DFLASH_SELECTOR_PREV,                   "selector_predecessor" },
+     { LLM_TENSOR_DFLASH_SELECTOR_NEXT,                   "selector_successor" },
+     { LLM_TENSOR_DFLASH_SELECTOR_HIDDEN,                 "selector_hidden" },
++    { LLM_TENSOR_DFLASH_CTX_MIX,                         "blk.%d.ctx_mix" },
++    { LLM_TENSOR_DFLASH_CTX_NORM,                        "blk.%d.ctx_norm" },
++    { LLM_TENSOR_DFLASH_ATTN_K_CTX,                      "blk.%d.attn_k_ctx" },
++    { LLM_TENSOR_DFLASH_ATTN_V_CTX,                      "blk.%d.attn_v_ctx" },
++    { LLM_TENSOR_DFLASH_ATTN_K_CTX_NORM,                 "blk.%d.attn_k_ctx_norm" },
+     { LLM_TENSOR_LILICORR_TOKEN_PROJ,                    "lilicorr.token_proj" },
+     { LLM_TENSOR_LILICORR_PASS_HIDDEN_PROJ,              "lilicorr.pass_hidden_proj" },
+     { LLM_TENSOR_LILICORR_SLOT_EMBD,                     "lilicorr.slot_embedding" },
+@@ -1262,6 +1289,19 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+     {LLM_TENSOR_FFN_LATENT_UP,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_FFN_POST_CONV,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_SSM_CONV}},
+     {LLM_TENSOR_FFN_RES_QUERY,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_LOOP_MSG_QUERY,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_LOOP_Q_CTRL_DOWN,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_LOOP_Q_CTRL_GAIN,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_LOOP_Q_CTRL_FORGET,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_LOOP_K_CTRL_DOWN,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_LOOP_K_CTRL_GAIN,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_LOOP_K_CTRL_FORGET,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_LOOP_V_CTRL_DOWN,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_LOOP_V_CTRL_GAIN,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_LOOP_V_CTRL_FORGET,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_LOOP_FFN_CTRL_DOWN,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_LOOP_FFN_CTRL_GAIN,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_LOOP_FFN_CTRL_FORGET,       {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_STREAM_EMBD,                {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_ADD}},
+     {LLM_TENSOR_DEPTH_MEM_STATE_WRITE,      {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_DEPTH_MEM_META_WRITE,       {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT}},
+@@ -1307,6 +1347,8 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+     {LLM_TENSOR_DSPARK_CONF_PROJ,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_DSPARK_JOINT_PROJ,          {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_DSPARK_MASK_EMBD,           {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
++    {LLM_TENSOR_DSPARK_MARKOV_CTX_MIX,      {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_DSPARK_MARKOV_CTX_NORM,     {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+     {LLM_TENSOR_ENGRAM_KV,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_ENGRAM_GATE,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+     {LLM_TENSOR_DFLASH_ATTN_CONV_BASE,      {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+@@ -1316,6 +1358,11 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+     {LLM_TENSOR_DFLASH_SELECTOR_PREV,       {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
+     {LLM_TENSOR_DFLASH_SELECTOR_NEXT,       {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
+     {LLM_TENSOR_DFLASH_SELECTOR_HIDDEN,     {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_DFLASH_CTX_MIX,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_DFLASH_CTX_NORM,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
++    {LLM_TENSOR_DFLASH_ATTN_K_CTX,          {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_DFLASH_ATTN_V_CTX,          {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_DFLASH_ATTN_K_CTX_NORM,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+     {LLM_TENSOR_LILICORR_TOKEN_PROJ,        {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_LILICORR_PASS_HIDDEN_PROJ,  {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_LILICORR_SLOT_EMBD,         {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_ADD}},
+@@ -1448,6 +1495,7 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
+         case LLM_ARCH_MINIMAX_01:
+         case LLM_ARCH_ZONOS3:
+         case LLM_ARCH_INKLING2:
++        case LLM_ARCH_INKLING2_LOOP:
+             return true;
+         default:
+             return false;
+@@ -1484,6 +1532,7 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
+         case LLM_ARCH_LFM3:
+         case LLM_ARCH_BAILINGMOE3:
+         case LLM_ARCH_INKLING2:
++        case LLM_ARCH_INKLING2_LOOP:
+             return true;
+         default:
+             return false;
+@@ -1502,6 +1551,7 @@ bool llm_arch_supports_mixed_batch(const llm_arch & arch) {
+         case LLM_ARCH_GEMMA4_ASSISTANT:
+         case LLM_ARCH_LIMITE:
+         case LLM_ARCH_INKLING2:
++        case LLM_ARCH_INKLING2_LOOP:
+             return false;
+         default:
+             return true;
+@@ -1531,6 +1581,7 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
+         case LLM_ARCH_JAMBA:
+         case LLM_ARCH_FALCON_H1:
+         case LLM_ARCH_INKLING2:
++        case LLM_ARCH_INKLING2_LOOP:
+         case LLM_ARCH_OLMO2:
+         case LLM_ARCH_OLMOE:
+         case LLM_ARCH_DEEPSEEK2:
+@@ -1586,6 +1637,7 @@ bool llama_arch_supports_save(llm_arch arch) {
+         case LLM_ARCH_APERTUS:
+         case LLM_ARCH_STEP35:
+         case LLM_ARCH_CLEF: // the head tensors are not saved
++        case LLM_ARCH_INKLING2_LOOP: // the loop tensors are not saved and the cache slots are expanded at load
+         case LLM_ARCH_VLLM_DECISION2:
+             return false;
+         default:
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index a8c0fdf09..dfa91448b 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -188,6 +188,7 @@ enum llm_arch {
+     LLM_ARCH_LIMITE,
+     LLM_ARCH_RICURSIVE,
+     LLM_ARCH_INKLING2,
++    LLM_ARCH_INKLING2_LOOP,
+     LLM_ARCH_DOMYN_EDGE,
+     LLM_ARCH_UNKNOWN,
+ };
+@@ -289,6 +290,11 @@ enum llm_kv {
+     LLM_KV_HRM_H_CYCLES,
+     LLM_KV_HRM_L_CYCLES,
+     LLM_KV_HRM_PREFIX_LM,
++    LLM_KV_LOOP_START,
++    LLM_KV_LOOP_END,
++    LLM_KV_LOOP_COUNT,
++    LLM_KV_LOOP_GATE_RANK,
++    LLM_KV_LOOP_VARYING,
+     LLM_KV_METIS_PASS_COUNT,
+     LLM_KV_METIS_MEMORY_LENGTH,
+     LLM_KV_METIS_ROUTE_LENGTH,
+@@ -491,6 +497,7 @@ enum llm_kv {
+     LLM_KV_DFLASH_CONV_GROUP_SIZE,
+     LLM_KV_DFLASH_SELECTOR_RANK,
+     LLM_KV_DFLASH_SELECTOR_TOP_K,
++    LLM_KV_DFLASH_HAS_MARKOV_CONTEXT,
+     LLM_KV_LILICORR_HIDDEN_SIZE,
+     LLM_KV_LILICORR_CANDIDATE_TOPK,
+     LLM_KV_LILICORR_NUM_HEADS,
+@@ -610,6 +617,19 @@ enum llm_tensor {
+     LLM_TENSOR_FFN_LATENT_UP,
+     LLM_TENSOR_FFN_POST_CONV,
+     LLM_TENSOR_FFN_RES_QUERY,
++    LLM_TENSOR_LOOP_MSG_QUERY,
++    LLM_TENSOR_LOOP_Q_CTRL_DOWN,
++    LLM_TENSOR_LOOP_Q_CTRL_GAIN,
++    LLM_TENSOR_LOOP_Q_CTRL_FORGET,
++    LLM_TENSOR_LOOP_K_CTRL_DOWN,
++    LLM_TENSOR_LOOP_K_CTRL_GAIN,
++    LLM_TENSOR_LOOP_K_CTRL_FORGET,
++    LLM_TENSOR_LOOP_V_CTRL_DOWN,
++    LLM_TENSOR_LOOP_V_CTRL_GAIN,
++    LLM_TENSOR_LOOP_V_CTRL_FORGET,
++    LLM_TENSOR_LOOP_FFN_CTRL_DOWN,
++    LLM_TENSOR_LOOP_FFN_CTRL_GAIN,
++    LLM_TENSOR_LOOP_FFN_CTRL_FORGET,
+     LLM_TENSOR_STREAM_EMBD,
+     LLM_TENSOR_DEPTH_MEM_STATE_WRITE,
+     LLM_TENSOR_DEPTH_MEM_META_WRITE,
+@@ -898,6 +918,8 @@ enum llm_tensor {
+     LLM_TENSOR_DSPARK_CONF_PROJ,
+     LLM_TENSOR_DSPARK_JOINT_PROJ,
+     LLM_TENSOR_DSPARK_MASK_EMBD,
++    LLM_TENSOR_DSPARK_MARKOV_CTX_MIX,
++    LLM_TENSOR_DSPARK_MARKOV_CTX_NORM,
+     LLM_TENSOR_ENGRAM_KV,
+     LLM_TENSOR_ENGRAM_GATE,
+     LLM_TENSOR_DFLASH_ATTN_CONV_BASE,
+@@ -907,6 +929,11 @@ enum llm_tensor {
+     LLM_TENSOR_DFLASH_SELECTOR_PREV,
+     LLM_TENSOR_DFLASH_SELECTOR_NEXT,
+     LLM_TENSOR_DFLASH_SELECTOR_HIDDEN,
++    LLM_TENSOR_DFLASH_CTX_MIX,
++    LLM_TENSOR_DFLASH_CTX_NORM,
++    LLM_TENSOR_DFLASH_ATTN_K_CTX,
++    LLM_TENSOR_DFLASH_ATTN_V_CTX,
++    LLM_TENSOR_DFLASH_ATTN_K_CTX_NORM,
+     LLM_TENSOR_LILICORR_TOKEN_PROJ,
+     LLM_TENSOR_LILICORR_PASS_HIDDEN_PROJ,
+     LLM_TENSOR_LILICORR_SLOT_EMBD,
+diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
+index 15c645562..c109eed3b 100644
+--- a/src/llama-batch.cpp
++++ b/src/llama-batch.cpp
+@@ -1285,6 +1285,10 @@ size_t llama_batch_ext_select_n_embd_state(llama_context_type ctx_type, const ll
+     if (hparams.lilicorr_candidate_topk > 0) {
+         return hparams.n_embd_inp();
+     }
++    if (hparams.dspark_f_rnn) {
++        // Inkling2 DSpark rnn head: f_rnn on the anchor row, [uniform | 1/temp] on the draft rows
++        return hparams.n_embd;
++    }
+     return 0;
+ }
+ 
+diff --git a/src/llama-hparams.h b/src/llama-hparams.h
+index 642f90118..b6a373bfe 100644
+--- a/src/llama-hparams.h
++++ b/src/llama-hparams.h
+@@ -304,6 +304,7 @@ struct llama_hparams {
+     uint32_t dflash_conv_group_size  = 0;
+     uint32_t dflash_selector_rank    = 0;
+     uint32_t dflash_selector_top_k   = 0;
++    bool     dspark_f_rnn            = false; // rnn markov head reads f_rnn from embd_state
+     uint32_t lilicorr_hidden_size    = 0;
+     uint32_t lilicorr_candidate_topk = 0;
+     uint32_t lilicorr_num_heads      = 0;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 02d24fd1b..00acb3cd7 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -328,6 +328,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
+             return new llama_model_falcon_h1(params);
+         case LLM_ARCH_INKLING2:
+             return new llama_model_inkling2(params);
++        case LLM_ARCH_INKLING2_LOOP:
++            return new llama_model_inkling2_loop(params);
+         case LLM_ARCH_LFM2:
+             return new llama_model_lfm2(params);
+         case LLM_ARCH_LFM2MOE:
+@@ -3921,7 +3923,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                         filter_idx = [&](uint32_t il) {
+                             return il < hparams.n_layer() && !hparams.is_recr(il) && hparams.is_indexer_full(il);
+                         };
+-                    } else if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_ZAYA1) {
++                    } else if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP || arch == LLM_ARCH_ZAYA1) {
+                         filter_attn = [&](uint32_t) { return true; };
+                         filter_recr = [&](uint32_t) { return true; };
+                     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
+@@ -4395,6 +4397,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+         case LLM_ARCH_GLM5_NEXT:
+         case LLM_ARCH_STARCODER:
+         case LLM_ARCH_INKLING2:
++        case LLM_ARCH_INKLING2_LOOP:
+         case LLM_ARCH_KOKORO:
+             return LLAMA_ROPE_TYPE_NONE;
+ 
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 0bbb1b585..aa1788a4b 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -424,6 +424,13 @@ struct llama_layer {
+     struct ggml_tensor * dflash_ffn_conv_base  = nullptr;
+     struct ggml_tensor * dflash_ffn_conv_proj  = nullptr;
+ 
++    // per-layer context K/V from mixed target features (Inkling2 DSpark)
++    struct ggml_tensor * dflash_ctx_mix         = nullptr;
++    struct ggml_tensor * dflash_ctx_norm        = nullptr;
++    struct ggml_tensor * dflash_wk_ctx          = nullptr;
++    struct ggml_tensor * dflash_wv_ctx          = nullptr;
++    struct ggml_tensor * dflash_attn_k_ctx_norm = nullptr;
++
+     struct ggml_tensor * lilicorr_attn_norm       = nullptr;
+     struct ggml_tensor * lilicorr_mlp_norm        = nullptr;
+     struct ggml_tensor * lilicorr_attn_in_proj    = nullptr;
+@@ -951,6 +958,9 @@ struct llama_model {
+     struct ggml_tensor * dspark_joint_proj   = nullptr; // rnn markov head
+     struct ggml_tensor * dspark_joint_proj_b = nullptr;
+     struct ggml_tensor * dspark_mask_embd    = nullptr; // per-slot mask embeddings
++    struct ggml_tensor * dspark_markov_w2_b      = nullptr;
++    struct ggml_tensor * dspark_markov_ctx_mix   = nullptr; // rnn markov head: f_rnn from target features
++    struct ggml_tensor * dspark_markov_ctx_norm  = nullptr;
+ 
+     // zaya1
+     struct ggml_tensor * res_scale_in   = nullptr;
+diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
+index 42a139870..d6478269c 100644
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -340,12 +340,13 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
+         quantize &= name.find("mudd_")               == std::string::npos;
+     }
+ 
+-    // inkling2: short conv kernels, clip scales, residual mix queries and the relative bias projection
+-    if (arch == LLM_ARCH_INKLING2) {
++    // inkling2: short conv kernels, clip scales, residual mix queries, the relative bias projection and the loop tensors
++    if (arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) {
+         quantize &= name.find("_conv.weight")         == std::string::npos;
+         quantize &= name.find("_clip.weight")         == std::string::npos;
+         quantize &= name.find("_res_query.weight")    == std::string::npos;
+         quantize &= name.find("attn_rel_bias.weight") == std::string::npos;
++        quantize &= name.find(".loop_")               == std::string::npos;
+     }
+ 
+     // zaya1: the top-1 router and the grouped conv kernels stay F32
+diff --git a/src/models/dflash.cpp b/src/models/dflash.cpp
+index 5dcb2226c..d347a90fc 100644
+--- a/src/models/dflash.cpp
++++ b/src/models/dflash.cpp
+@@ -42,6 +42,10 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
+     const bool has_lilicorr = ml.get_key(LLM_KV_LILICORR_HIDDEN_SIZE, hparams.lilicorr_hidden_size, false);
+     if (has_markov) {
+         variant = VARIANT_DSPARK;
++        ml.get_key(LLM_KV_DFLASH_HAS_MARKOV_CONTEXT, hparams.dspark_f_rnn, false);
++        if (!hparams.dspark_f_rnn && ml.get_tensor_meta("markov_ctx_norm.weight")) {
++            throw std::runtime_error("DSpark model has 'markov_ctx_norm.weight' but 'has_markov_context' is not true in GGUF metadata");
++        }
+     } else if (has_selector) {
+         variant = VARIANT_DFLASH2;
+     } else if (has_lilicorr) {
+@@ -108,12 +112,18 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
+         case VARIANT_DFLASH:                                       break;
+     }
+ 
+-    fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, 0);
++    // drafts with per-layer context K/V (ctx_mix) have no shared fc
++    const int fc_flags = ml->get_tensor_meta("blk.0.ctx_mix.weight") ? TENSOR_NOT_REQUIRED : 0;
++
++    fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, fc_flags);
+     fc_s            = create_tensor(tn(LLM_TENSOR_FC,              "scale"),  { 1 }, TENSOR_NOT_REQUIRED);
+     fc_in_s         = create_tensor(tn(LLM_TENSOR_FC,              "input_scale"), { 1 }, TENSOR_NOT_REQUIRED);
+-    output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, 0); // encoder hidden_norm (after fc)
++    output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, fc_flags); // encoder hidden_norm (after fc)
+     output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,    "weight"), { n_embd }, 0); // decoder final norm
+ 
++    // optional: norm of the anchor embedding
++    tok_norm        = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD_NORM, "weight", 0), { n_embd }, TENSOR_NOT_REQUIRED);
++
+     // optional: reduced-vocab drafts ship their own lm head, full-vocab drafts can share the target's via ctx_other
+     // a draft with its own embeddings + head references no target tensors and can run on devices the target does not use (e.g. -devd with a tensor-split target)
+     output   = create_tensor(tn(LLM_TENSOR_OUTPUT,     "weight"), { n_embd, n_vocab_draft }, TENSOR_NOT_REQUIRED);
+@@ -168,6 +178,15 @@ void llama_model_dflash::load_tensors_layers_base() {
+         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), { n_embd, n_ff }, 0);
+         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), { n_ff, n_embd }, 0);
+         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), { n_embd, n_ff }, 0);
++
++        // optional: context K/V from this layer's own mix of the target features
++        layer.dflash_ctx_mix = create_tensor(tn(LLM_TENSOR_DFLASH_CTX_MIX, "weight", i), { (int64_t) target_layer_ids.size() }, TENSOR_NOT_REQUIRED);
++        if (layer.dflash_ctx_mix) {
++            layer.dflash_ctx_norm        = create_tensor(tn(LLM_TENSOR_DFLASH_CTX_NORM,        "weight", i), { n_embd }, 0);
++            layer.dflash_wk_ctx          = create_tensor(tn(LLM_TENSOR_DFLASH_ATTN_K_CTX,      "weight", i), { n_embd, n_embd_k_gqa }, 0);
++            layer.dflash_wv_ctx          = create_tensor(tn(LLM_TENSOR_DFLASH_ATTN_V_CTX,      "weight", i), { n_embd, n_embd_v_gqa }, 0);
++            layer.dflash_attn_k_ctx_norm = create_tensor(tn(LLM_TENSOR_DFLASH_ATTN_K_CTX_NORM, "weight", i), { n_embd_head_k }, 0);
++        }
+     }
+ }
+ 
+@@ -528,8 +547,46 @@ ggml_tensor * llama_model_dflash::graph_base::build_rope(ggml_tensor * cur, ggml
+                 ext_factor, attn_factor, beta_fast, beta_slow);
+ }
+ 
++// write one layer's injected K/V to its (sub-)cache
++void llama_model_dflash::graph_base::store_inject_kv(ggml_tensor * Kcur, ggml_tensor * Vcur, int il) {
++    if (use_iswa) {
++        // route each layer's K/V to its sub-cache: SWA layers -> sliding cache, full -> dense
++        const bool    is_swa = hparams.is_swa(il);
++        const auto  * kv     = is_swa ? inp_attn_iswa->mctx->get_swa() : inp_attn_iswa->mctx->get_base();
++        ggml_tensor * k_idxs = is_swa ? inp_attn_iswa->get_k_idxs_swa() : inp_attn_iswa->get_k_idxs();
++        ggml_tensor * v_idxs = is_swa ? inp_attn_iswa->get_v_idxs_swa() : inp_attn_iswa->get_v_idxs();
++        // rotate K/V into the cache's rotated space
++        ggml_tensor * k_rot  = is_swa ? inp_attn_iswa->self_k_rot_swa[il] : inp_attn_iswa->self_k_rot[il];
++        ggml_tensor * v_rot  = is_swa ? inp_attn_iswa->self_v_rot_swa[il] : inp_attn_iswa->self_v_rot[il];
++        if (k_rot) {
++            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, k_rot);
++        }
++        if (v_rot) {
++            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, v_rot);
++        }
++        ggml_build_forward_expand(gf, kv->cpy_k(ctx0, Kcur, k_idxs, il));
++        ggml_build_forward_expand(gf, kv->cpy_v(ctx0, Vcur, v_idxs, il));
++    } else {
++        // rotate K/V into the cache's rotated space
++        if (inp_attn->self_k_rot[il]) {
++            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot[il]);
++        }
++        if (inp_attn->self_v_rot[il]) {
++            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot[il]);
++        }
++        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
++        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
++    }
++}
++
+ // KV cache injection
+ ggml_tensor * llama_model_dflash::graph_base::build_inject() {
++    // drafts without fc: each layer mixes the raw target features itself
++    if (!model.fc && model.layers[0].dflash_ctx_mix) {
++        build_inject_ctx_mix();
++        return nullptr;
++    }
++
+     ggml_tensor * inp_g = build_inject_inp(*this, model);
+     cb(inp_g, "inp_g_embeddings", -1);
+ 
+@@ -551,34 +608,7 @@ ggml_tensor * llama_model_dflash::graph_base::build_inject() {
+         cb(Kcur, "Kcur_injected", il);
+         cb(Vcur, "Vcur_injected", il);
+ 
+-        if (use_iswa) {
+-            // route each layer's K/V to its sub-cache: SWA layers -> sliding cache, full -> dense
+-            const bool    is_swa = hparams.is_swa(il);
+-            const auto  * kv     = is_swa ? inp_attn_iswa->mctx->get_swa() : inp_attn_iswa->mctx->get_base();
+-            ggml_tensor * k_idxs = is_swa ? inp_attn_iswa->get_k_idxs_swa() : inp_attn_iswa->get_k_idxs();
+-            ggml_tensor * v_idxs = is_swa ? inp_attn_iswa->get_v_idxs_swa() : inp_attn_iswa->get_v_idxs();
+-            // rotate K/V into the cache's rotated space
+-            ggml_tensor * k_rot  = is_swa ? inp_attn_iswa->self_k_rot_swa[il] : inp_attn_iswa->self_k_rot[il];
+-            ggml_tensor * v_rot  = is_swa ? inp_attn_iswa->self_v_rot_swa[il] : inp_attn_iswa->self_v_rot[il];
+-            if (k_rot) {
+-                Kcur = llama_mul_mat_hadamard(ctx0, Kcur, k_rot);
+-            }
+-            if (v_rot) {
+-                Vcur = llama_mul_mat_hadamard(ctx0, Vcur, v_rot);
+-            }
+-            ggml_build_forward_expand(gf, kv->cpy_k(ctx0, Kcur, k_idxs, il));
+-            ggml_build_forward_expand(gf, kv->cpy_v(ctx0, Vcur, v_idxs, il));
+-        } else {
+-            // rotate K/V into the cache's rotated space
+-            if (inp_attn->self_k_rot[il]) {
+-                Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot[il]);
+-            }
+-            if (inp_attn->self_v_rot[il]) {
+-                Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot[il]);
+-            }
+-            ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
+-            ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
+-        }
++        store_inject_kv(Kcur, Vcur, il);
+     }
+ 
+     res->t_embd = inp_g;
+@@ -588,6 +618,50 @@ ggml_tensor * llama_model_dflash::graph_base::build_inject() {
+     return inp_g;
+ }
+ 
++// KV cache injection with per-layer context K/V (Inkling2 DSpark): rms_norm(sum_i ctx_mix[i] * target_i) * ctx_norm -> k_ctx / v_ctx
++// also outputs f_rnn (the same mix for the markov head) as h_nextn
++void llama_model_dflash::graph_base::build_inject_ctx_mix() {
++    const int64_t n_embd_inp = hparams.n_embd_inp_enc();
++    const int64_t n_target   = n_embd_inp / n_embd;
++
++    auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
++    ggml_tensor * feats = build_inp_target_features(*this, *inp, n_embd_inp);
++    res->add_input(std::move(inp));
++
++    // [n_target, n_embd, n_tokens]: the mix is a matmul over the target taps
++    feats = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, feats, n_embd, n_target, n_tokens), 1, 0, 2, 3));
++    cb(feats, "inp_target_features", -1);
++
++    const auto build_mix = [&](ggml_tensor * mix, ggml_tensor * norm, int il) {
++        ggml_tensor * cur = ggml_reshape_2d(ctx0, ggml_mul_mat(ctx0, mix, feats), n_embd, n_tokens);
++        return build_norm(cur, norm, nullptr, LLM_NORM_RMS, il);
++    };
++
++    // the driver keeps the f_rnn rows of the context positions
++    if (model.dspark_markov_ctx_mix) {
++        res->t_h_nextn = build_mix(model.dspark_markov_ctx_mix, model.dspark_markov_ctx_norm, -1);
++        cb(res->t_h_nextn, "f_rnn", -1);
++        ggml_build_forward_expand(gf, res->t_h_nextn);
++    }
++
++    for (int il = 0; il < n_layer; ++il) {
++        const auto & layer = model.layers[il];
++        GGML_ASSERT(layer.dflash_ctx_mix && "DFlash draft without fc requires per-layer ctx_mix");
++
++        ggml_tensor * cur = build_mix(layer.dflash_ctx_mix, layer.dflash_ctx_norm, il);
++
++        ggml_tensor * Kcur = ggml_reshape_3d(ctx0, build_lora_mm(layer.dflash_wk_ctx, cur), n_embd_head, n_head_kv, n_tokens);
++        ggml_tensor * Vcur = ggml_reshape_3d(ctx0, build_lora_mm(layer.dflash_wv_ctx, cur), n_embd_head, n_head_kv, n_tokens);
++
++        Kcur = build_norm(Kcur, layer.dflash_attn_k_ctx_norm, NULL, LLM_NORM_RMS, il);
++        Kcur = build_rope(Kcur, inp_pos, il);
++        cb(Kcur, "Kcur_injected", il);
++        cb(Vcur, "Vcur_injected", il);
++
++        store_inject_kv(Kcur, Vcur, il);
++    }
++}
++
+ ggml_tensor * llama_model_dflash::graph_base::build_inp_tokens() {
+     ggml_tensor * inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+     ggml_set_input(inp_tokens);
+@@ -604,7 +678,9 @@ ggml_tensor * llama_model_dflash::graph_base::build_inp_tokens() {
+ ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tokens) {
+     const float kq_scale = hparams.f_attention_scale != 0.0f ? hparams.f_attention_scale : 1.0f/sqrtf(float(n_embd_head));
+ 
+-    ggml_tensor * inpL = ggml_get_rows(ctx0, get_tok_embd(*this, model), inp_tokens);
++    ggml_tensor * inpL = model.dspark_mask_embd
++        ? build_dspark_inp_block(*this, model, inp_tokens)
++        : ggml_get_rows(ctx0, get_tok_embd(*this, model), inp_tokens);
+     if (hparams.f_embedding_scale != 0.0f) {
+         inpL = ggml_scale(ctx0, inpL, hparams.f_embedding_scale);
+     }
+@@ -716,6 +792,11 @@ ggml_tensor * llama_model_dflash::graph_base::build_logits(ggml_tensor * cur) {
+     const auto [output, output_s] = get_lm_head(*this, model);
+     cur = build_lora_mm(output, cur, output_s);
+ 
++    // a padded lm head (e.g. shared from the target): drop the rows past the vocabulary
++    if (!model.d2t && cur->ne[0] > (int64_t) model.vocab.n_tokens()) {
++        cur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, model.vocab.n_tokens(), cur->ne[1], cur->nb[1], 0));
++    }
++
+     // DFlash2 feeds these logits to the selector, so they need the target's output
+     // transforms; DFlash1 and DSpark read them through the sampler instead
+     if (model.dflash_selector_hidden) {
+diff --git a/src/models/dspark.cpp b/src/models/dspark.cpp
+index b92c89761..81ededc79 100644
+--- a/src/models/dspark.cpp
++++ b/src/models/dspark.cpp
+@@ -84,13 +84,27 @@ void llama_model_dflash::load_tensors_dspark(int64_t n_vocab_draft) {
+     dspark_markov_w1   = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W1, "weight"), { dspark_markov_rank, n_vocab }, 0);
+     dspark_markov_w2   = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "weight"), { dspark_markov_rank, n_vocab_draft }, 0);
+     dspark_markov_w2_s = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "scale"),  { 1 }, TENSOR_NOT_REQUIRED);
++    dspark_markov_w2_b = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "bias"),   { n_vocab_draft }, TENSOR_NOT_REQUIRED);
+ 
+     dspark_conf_proj   = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_PROJ, "weight"), { n_embd + dspark_markov_rank, 1 }, TENSOR_NOT_REQUIRED);
+     dspark_conf_proj_b = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_PROJ, "bias"),   { 1 },             TENSOR_NOT_REQUIRED);
+ 
+-    dspark_joint_proj   = create_tensor(tn(LLM_TENSOR_DSPARK_JOINT_PROJ, "weight"), { n_embd + 2*dspark_markov_rank, 3*dspark_markov_rank }, TENSOR_NOT_REQUIRED);
++    // f_rnn: the rnn head also reads a mix of the target features of the last committed token
++    const int64_t n_joint = (hparams.dspark_f_rnn ? 2*n_embd : n_embd) + 2*dspark_markov_rank;
++
++    dspark_joint_proj   = create_tensor(tn(LLM_TENSOR_DSPARK_JOINT_PROJ, "weight"), { n_joint, 3*dspark_markov_rank }, TENSOR_NOT_REQUIRED);
+     dspark_joint_proj_b = create_tensor(tn(LLM_TENSOR_DSPARK_JOINT_PROJ, "bias"),   { 3*dspark_markov_rank }, dspark_joint_proj ? 0 : TENSOR_NOT_REQUIRED);
+ 
++    if (hparams.dspark_f_rnn) {
++        dspark_markov_ctx_mix  = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_CTX_MIX,  "weight"), { (int64_t) target_layer_ids.size() }, 0);
++        dspark_markov_ctx_norm = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_CTX_NORM, "weight"), { n_embd }, 0);
++    }
++
++    // the ML4 backbone loads its own mask_embd
++    if (backbone == BACKBONE_BASE) {
++        dspark_mask_embd = create_tensor(tn(LLM_TENSOR_DSPARK_MASK_EMBD, "weight"), { n_embd, hparams.dflash_block_size - 1 }, TENSOR_NOT_REQUIRED);
++    }
++
+     LLAMA_LOG_INFO("%s: DFlash with DSpark markov head (rank = %lld)\n", __func__, (long long) dspark_markov_rank);
+ }
+ 
+@@ -176,8 +190,47 @@ void llama_model_dflash::load_tensors_layers_mistral_large4() {
+     }
+ }
+ 
++// DSpark block [anchor, mask_1, ..., mask_k] per sequence: slot k > 0 uses mask row k - 1, the anchor uses its (normed) token embedding
++ggml_tensor * llama_model_dflash::build_dspark_inp_block(const llm_graph_context & g, const llama_model & model, ggml_tensor * inp_tokens) {
++    ggml_context * ctx0 = g.ctx0;
++
++    const int64_t n_embd   = g.n_embd;
++    const int64_t n_tokens = g.n_tokens;
++
++    ggml_tensor * tok_embd = get_tok_embd(g, model);
++
++    const int64_t n_blocks     = g.ubatch.n_seqs_unq;
++    const int64_t block_drafts = n_blocks > 0 ? n_tokens / n_blocks : 0;
++
++    if (block_drafts == 0 || n_tokens % n_blocks != 0 || block_drafts > (int64_t) g.hparams.dflash_block_size) {
++        // not a draft block (e.g. graph reserve)
++        return ggml_get_rows(ctx0, tok_embd, inp_tokens);
++    }
++
++    ggml_tensor * anchors = ggml_view_2d(ctx0, inp_tokens, 1, n_blocks, (size_t) block_drafts * inp_tokens->nb[0], 0);
++    anchors = ggml_get_rows(ctx0, tok_embd, ggml_cont_1d(ctx0, anchors, n_blocks));
++    if (model.tok_norm) {
++        anchors = g.build_norm(anchors, model.tok_norm, nullptr, LLM_NORM_RMS, -1);
++    }
++
++    ggml_tensor * cur = ggml_reshape_3d(ctx0, anchors, n_embd, 1, n_blocks);
++    if (block_drafts > 1) {
++        ggml_tensor * masks = ggml_view_3d(ctx0, model.dspark_mask_embd, n_embd, block_drafts - 1, 1,
++                model.dspark_mask_embd->nb[1], model.dspark_mask_embd->nb[2], 0);
++        masks = ggml_repeat_4d(ctx0, ggml_cast(ctx0, masks, GGML_TYPE_F32), n_embd, block_drafts - 1, n_blocks, 1);
++        cur = ggml_concat(ctx0, cur, masks, 1);
++    }
++
++    return ggml_reshape_2d(ctx0, cur, n_embd, n_tokens);
++}
++
+ // DSpark (DFlash + Markov & Confidence head): Markov bias on the draft logits, chained per block position
+-static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens, ggml_tensor * hidden = nullptr) {
++// rnn_state: [n_embd, n_tokens] per-token state of the Inkling2 rnn head (see llama_batch_ext_select_n_embd_state)
++//   anchor row: f_rnn, an extra rnn input; draft row i: [uniform | 1/temp | 0...] of its draw
++//   each step draws its token at 1/temp (0: argmax) and packs [token, k, ids, probs] into h_nextn
++// softcap_after_bias: softcap(base + bias) instead of leaving the logits uncapped
++static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens, ggml_tensor * hidden = nullptr,
++        ggml_tensor * rnn_state = nullptr, bool softcap_after_bias = false) {
+     ggml_context * ctx0 = g.ctx0;
+     auto         & res  = g.res;
+ 
+@@ -221,8 +274,66 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model &
+     ggml_tensor * prev = ggml_view_2d(ctx0, tokens, 1, n_blocks, token_stride, 0);
+     prev = ggml_cont_1d(ctx0, prev, n_blocks);
+ 
++    const int64_t n_embd = g.hparams.n_embd;
++
++    // n_rows values from offset off of the state at block position i, [n_rows, n_blocks]
++    const auto state_rows = [&](int64_t n_rows, int64_t off, int64_t i) {
++        return ggml_cont(ctx0, ggml_view_2d(ctx0, rnn_state, n_rows, n_blocks, (size_t) block_drafts * rnn_state->nb[1],
++                i*rnn_state->nb[1] + off*ggml_element_size(rnn_state)));
++    };
++
++    ggml_tensor * f_rnn     = nullptr; // [n_embd, n_blocks]
++    ggml_tensor * inv_temp  = nullptr; // [1, n_blocks]
++    ggml_tensor * is_greedy = nullptr; // [1, n_blocks], 1 when inv_temp is 0
++    if (rnn_state) {
++        // the anchor row holds f_rnn, so it cannot be a draft row
++        GGML_ASSERT(!has_conf && !sample_from_anchor && rnn_state->ne[0] == n_embd);
++        f_rnn = state_rows(n_embd, 0, 0);
++        if (block_drafts > i_draft_beg) {
++            inv_temp  = state_rows(1, 1, i_draft_beg);
++            is_greedy = ggml_scale_bias(ctx0, ggml_step(ctx0, inv_temp), -1.0f, 1.0f);
++        }
++    }
++
++    // the draws keep the top n_cand candidates, q of the verifier is their distribution
++    const int64_t n_cand = std::min<int64_t>(64, n_vocab);
++    GGML_ASSERT(!rnn_state || 2 + 2*n_cand <= n_embd);
++
++    // draw the token of block position i from softmax(top_k(col) * inv_temp), like the backend dist sampler
++    // returns [n_embd, n_blocks] packed rows [token, n_cand, ids, probs] and sets the next prev
++    const auto draw = [&](ggml_tensor * col, int64_t i, ggml_tensor *& next) {
++        ggml_tensor * ids   = ggml_top_k(ctx0, col, n_cand); // [n_cand, n_blocks], unordered
++        ggml_tensor * vals  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, col, 1, n_vocab, n_blocks), ids), n_cand, n_blocks);
++
++        // the top-k order can change between runs, sort by logit so a seed draws the same tokens
++        ggml_tensor * order = ggml_argsort(ctx0, vals, GGML_SORT_ORDER_DESC);
++        ids  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, ids,  1, n_cand, n_blocks), order), n_cand, n_blocks);
++        vals = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, vals, 1, n_cand, n_blocks), order), n_cand, n_blocks);
++
++        ggml_tensor * probs = ggml_soft_max(ctx0, ggml_mul(ctx0, vals, inv_temp));
++
++        // index of the first candidate whose cumulative probability passes the uniform
++        ggml_tensor * n_over = ggml_sum_rows(ctx0, ggml_step(ctx0, ggml_sub(ctx0, ggml_cumsum(ctx0, probs), state_rows(1, 0, i))));
++        ggml_tensor * idx    = ggml_cast(ctx0, ggml_scale_bias(ctx0, ggml_clamp(ctx0, n_over, 1.0f, (float) n_cand), -1.0f, (float) n_cand), GGML_TYPE_I32);
++
++        ggml_tensor * ids_f  = ggml_cast(ctx0, ids, GGML_TYPE_F32);
++        ggml_tensor * drawn  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, ids_f, 1, n_cand, n_blocks), idx), 1, n_blocks);
++        ggml_tensor * argmax = ggml_reshape_2d(ctx0, ggml_cast(ctx0, ggml_argmax(ctx0, col), GGML_TYPE_F32), 1, n_blocks);
++
++        // greedy keeps the exact argmax
++        ggml_tensor * tok = ggml_add(ctx0, drawn, ggml_mul(ctx0, is_greedy, ggml_sub(ctx0, argmax, drawn)));
++        next = ggml_cast(ctx0, ggml_reshape_1d(ctx0, tok, n_blocks), GGML_TYPE_I32);
++
++        ggml_tensor * k_col = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_blocks), (float) n_cand);
++        ggml_tensor * row   = ggml_concat(ctx0, ggml_concat(ctx0, ggml_concat(ctx0, tok, k_col, 0), ids_f, 0), probs, 0);
++        return ggml_pad(ctx0, row, n_embd - row->ne[0], 0, 0, 0);
++    };
++
++    const float softcap = softcap_after_bias ? g.hparams.f_final_logit_softcapping : 0.0f;
++
+     ggml_tensor * cat      = nullptr;
+     ggml_tensor * cat_conf = nullptr;
++    ggml_tensor * cat_draw = nullptr;
+ 
+     if (!sample_from_anchor) {
+         // bonus anchor slot: pass the logits through unbiased, pad the (unread) confidence column
+@@ -230,11 +341,14 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model &
+         if (has_conf) {
+             cat_conf = ggml_sigmoid(ctx0, ggml_view_2d(ctx0, base, 1, n_blocks, base_stride, 0));
+         }
++        if (rnn_state) {
++            cat_draw = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_blocks), 0.0f);
++        }
+     }
+ 
+     ggml_tensor * state = nullptr; // [R, n_blocks]
+ 
+-    // TODO: the in-graph chain is greedy (argmax); sampling params affect only the final
++    // TODO: without rnn_state the in-graph chain is greedy (argmax); sampling params affect only the final
+     //       token pick, not the Markov conditioning path
+     for (int64_t i = i_draft_beg; i < block_drafts; ++i) {
+         ggml_tensor * w1_prev = ggml_get_rows(ctx0, w1, prev); // [R, n_blocks]
+@@ -249,6 +363,9 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model &
+             ggml_tensor * hidden_i = ggml_view_2d(ctx0, hidden, hidden->ne[0], n_blocks,
+                                                   (size_t) block_drafts * hidden->nb[1], i*hidden->nb[1]);
+             ggml_tensor * joint = ggml_concat(ctx0, ggml_concat(ctx0, state, w1_prev, 0), ggml_cont(ctx0, hidden_i), 0);
++            if (f_rnn) {
++                joint = ggml_concat(ctx0, joint, f_rnn, 0);
++            }
+             joint = ggml_add(ctx0, ggml_mul_mat(ctx0, model.dspark_joint_proj, joint), model.dspark_joint_proj_b); // [3R, n_blocks]
+ 
+             const auto chunk = [&](int64_t k) {
+@@ -263,6 +380,9 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model &
+         }
+ 
+         ggml_tensor * bias = g.build_lora_mm(w2, markov, model.dspark_markov_w2_s); // [n_vocab_draft, n_blocks]
++        if (model.dspark_markov_w2_b) {
++            bias = ggml_add(ctx0, bias, model.dspark_markov_w2_b);
++        }
+         if (model.d2t) {
+             // reduced draft vocab: scatter the bias to the target rows (base is -inf on the others)
+             const int64_t n_draft_vocab = bias->ne[0];
+@@ -276,6 +396,9 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model &
+         // position i of every block: strided view [n_vocab, n_blocks]
+         ggml_tensor * base_i = ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, i*base->nb[1]);
+         ggml_tensor * col    = ggml_add(ctx0, base_i, bias);
++        if (softcap > 0.0f) {
++            col = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, col, 1.0f/softcap)), softcap);
++        }
+ 
+         cat = cat ? ggml_concat(ctx0, cat, col, 1) : col;
+ 
+@@ -295,11 +418,22 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model &
+             cat_conf = cat_conf ? ggml_concat(ctx0, cat_conf, conf, 1) : conf;
+         }
+ 
+-        if (i + 1 < block_drafts) {
++        if (rnn_state) {
++            ggml_tensor * packed = draw(col, i, prev);
++            cat_draw = cat_draw ? ggml_concat(ctx0, cat_draw, packed, 1) : packed;
++        } else if (i + 1 < block_drafts) {
+             prev = ggml_argmax(ctx0, col);
+         }
+     }
+ 
++    if (cat_draw) {
++        // position-major like cat; restore ubatch block-major order
++        ggml_tensor * draws = ggml_reshape_3d(ctx0, cat_draw, n_embd, n_blocks, block_drafts);
++        draws = ggml_cont(ctx0, ggml_permute(ctx0, draws, 0, 2, 1, 3));
++        res->t_h_nextn = ggml_reshape_2d(ctx0, draws, n_embd, n_tok);
++        ggml_build_forward_expand(g.gf, res->t_h_nextn);
++    }
++
+     // cat is position-major; restore ubatch block-major order
+     ggml_tensor * out = ggml_reshape_3d(ctx0, cat, n_vocab, n_blocks, block_drafts);
+     out = ggml_cont(ctx0, ggml_permute(ctx0, out, 0, 2, 1, 3)); // [n_vocab, block_drafts, n_blocks]
+@@ -327,13 +461,39 @@ llama_model_dflash::graph_dspark::graph_dspark(const llm_graph_params & params)
+         return;
+     }
+ 
+-    ggml_tensor * inp_tokens = build_inp_tokens();
+-    ggml_tensor * cur        = build_layers(inp_tokens);
++    // the Inkling2 rnn head state arrives as the state embedding of the block tokens
++    ggml_tensor * inp_tokens = nullptr;
++    ggml_tensor * rnn_state  = nullptr;
++    if (hparams.dspark_f_rnn && ubatch.embd_state) {
++        inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
++        ggml_set_input(inp_tokens);
++        res->t_inp_tokens = inp_tokens;
++
++        auto inp = std::make_unique<llm_graph_input_embd_h>(n_embd, n_embd);
++        inp->tokens = inp_tokens;
++        inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
++        ggml_set_input(inp->h);
++        rnn_state = inp->h;
++        res->add_input(std::move(inp));
++    } else {
++        inp_tokens = build_inp_tokens();
++    }
++
++    // the whole block shares the mask row of its first query (the anchor)
++    if (model.dspark_mask_embd && use_iswa) {
++        inp_attn_iswa->self_attn_mask_swa.block_uniform = true;
++    }
++
++    ggml_tensor * cur = build_layers(inp_tokens);
+ 
+     build_logits(cur);
+ 
+     // bias the draft logits with the Markov head
+-    build_dspark_markov_head(*this, model, inp_tokens);
++    if (!hparams.dspark_f_rnn) {
++        build_dspark_markov_head(*this, model, inp_tokens);
++    } else if (rnn_state) {
++        build_dspark_markov_head(*this, model, inp_tokens, cur, rnn_state, true);
++    }
+ }
+ 
+ // DSV4 DSpark decoder, dual-mode by batch type (see graph_base):
+@@ -747,8 +907,6 @@ llama_model_dflash::graph_mistral_large4::graph_mistral_large4(const llm_graph_p
+         return;
+     }
+ 
+-    ggml_tensor * tok_embd = get_tok_embd(*this, model);
+-
+     auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
+ 
+     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+@@ -758,26 +916,7 @@ llama_model_dflash::graph_mistral_large4::graph_mistral_large4(const llm_graph_p
+ 
+     res->add_input(std::move(inp));
+ 
+-    const int64_t n_blocks     = ubatch.n_seqs_unq;
+-    const int64_t block_drafts = n_blocks > 0 ? n_tokens / n_blocks : 0;
+-
+-    ggml_tensor * inpL;
+-    if (block_drafts > 0 && n_tokens % n_blocks == 0 && block_drafts <= (int64_t) hparams.dflash_block_size) {
+-        // slot k > 0 uses mask row k - 1
+-        ggml_tensor * anchors = ggml_view_2d(ctx0, inp_tokens, 1, n_blocks, (size_t) block_drafts * inp_tokens->nb[0], 0);
+-        anchors = ggml_get_rows(ctx0, tok_embd, ggml_cont_1d(ctx0, anchors, n_blocks));
+-        inpL = ggml_reshape_3d(ctx0, anchors, n_embd, 1, n_blocks);
+-        if (block_drafts > 1) {
+-            ggml_tensor * masks = ggml_view_3d(ctx0, model.dspark_mask_embd, n_embd, block_drafts - 1, 1,
+-                    model.dspark_mask_embd->nb[1], model.dspark_mask_embd->nb[2], 0);
+-            masks = ggml_repeat_4d(ctx0, ggml_cast(ctx0, masks, GGML_TYPE_F32), n_embd, block_drafts - 1, n_blocks, 1);
+-            inpL = ggml_concat(ctx0, inpL, masks, 1);
+-        }
+-        inpL = ggml_reshape_2d(ctx0, inpL, n_embd, n_tokens);
+-    } else {
+-        // not a draft block (e.g. graph reserve)
+-        inpL = ggml_get_rows(ctx0, tok_embd, inp_tokens);
+-    }
++    ggml_tensor * inpL = build_dspark_inp_block(*this, model, inp_tokens);
+     cb(inpL, "inp_noise_embd", -1);
+ 
+     // the whole block shares the mask row of its first query (the anchor)
+diff --git a/src/models/inkling2-loop.cpp b/src/models/inkling2-loop.cpp
+new file mode 100644
+index 000000000..06337a7dc
+--- /dev/null
++++ b/src/models/inkling2-loop.cpp
+@@ -0,0 +1,121 @@
++#include "models.h"
++
++int llama_model_inkling2_loop::layer_phys(int il) const {
++    return il < n_phys ? il : core_start + (il - n_phys) % (core_end - core_start);
++}
++
++void llama_model_inkling2_loop::load_arch_hparams(llama_model_loader & ml) {
++    llama_model_inkling2::load_arch_hparams(ml);
++
++    ml.get_key(LLM_KV_LOOP_START,     core_start);
++    ml.get_key(LLM_KV_LOOP_END,       core_end);
++    ml.get_key(LLM_KV_LOOP_COUNT,     n_passes);
++    ml.get_key(LLM_KV_LOOP_GATE_RANK, gate_rank);
++    ml.get_key(LLM_KV_LOOP_VARYING,   varying, false);
++
++    n_phys = hparams.n_layer();
++    const uint32_t block = hparams.attn_res_block_size;
++    // a fixed loop needs at least 2 passes, a variable loop at least 1
++    if (n_passes < (varying ? 1u : 2u) || !gate_rank || !core_start || core_start >= core_end || core_end > (uint32_t) n_phys ||
++        core_start % block || core_end % block || hparams.n_layer_nextn) {
++        throw std::runtime_error(format("inkling2_loop: invalid loop core [%u, %u) with block size %u, %u passes or gate rank %u for %d layers",
++                core_start, core_end, block, n_passes, gate_rank, n_phys));
++    }
++    const size_t n_slot = n_phys + (size_t) (n_passes - 1)*(core_end - core_start);
++    if (n_slot > LLAMA_MAX_LAYERS) {
++        throw std::runtime_error(format("inkling2_loop: %zu cache slots exceed the maximum of %d", n_slot, LLAMA_MAX_LAYERS));
++    }
++
++    // expand to the cache slots before load_tensors() allocates the layers and the memory
++    hparams.n_layer_all = n_slot;
++    for (int il = n_phys; il < (int) n_slot; ++il) {
++        const int p = layer_phys(il);
++        hparams.n_head_arr[il]        = hparams.n_head_arr[p];
++        hparams.n_head_kv_arr[il]     = hparams.n_head_kv_arr[p];
++        hparams.n_ff_arr[il]          = hparams.n_ff_arr[p];
++        hparams.n_ff_exp_arr[il]      = hparams.n_ff_exp_arr[p];
++        hparams.n_expert_used_arr[il] = hparams.n_expert_used_arr[p];
++        hparams.is_swa_impl[il]       = hparams.is_swa_impl[p];
++        hparams.is_recr_impl[il]      = hparams.is_recr_impl[p];
++    }
++}
++
++void llama_model_inkling2_loop::load_arch_tensors(llama_model_loader & ml) {
++    llama_model_inkling2::load_arch_tensors(ml);
++
++    const int64_t n_embd = hparams.n_embd;
++    const int64_t rank   = gate_rank;
++    const llm_tensor down[LOOP_CTRL_COUNT]   = { LLM_TENSOR_LOOP_Q_CTRL_DOWN,   LLM_TENSOR_LOOP_K_CTRL_DOWN,   LLM_TENSOR_LOOP_V_CTRL_DOWN,   LLM_TENSOR_LOOP_FFN_CTRL_DOWN   };
++    const llm_tensor gain[LOOP_CTRL_COUNT]   = { LLM_TENSOR_LOOP_Q_CTRL_GAIN,   LLM_TENSOR_LOOP_K_CTRL_GAIN,   LLM_TENSOR_LOOP_V_CTRL_GAIN,   LLM_TENSOR_LOOP_FFN_CTRL_GAIN   };
++    const llm_tensor forget[LOOP_CTRL_COUNT] = { LLM_TENSOR_LOOP_Q_CTRL_FORGET, LLM_TENSOR_LOOP_K_CTRL_FORGET, LLM_TENSOR_LOOP_V_CTRL_FORGET, LLM_TENSOR_LOOP_FFN_CTRL_FORGET };
++
++    loop_layers.resize(core_end - core_start);
++    for (uint32_t il = core_start; il < core_end; ++il) {
++        auto & l = loop_layers[il - core_start];
++        // the q, k, v and ffn message queries
++        l.msg_query = create_tensor(tn(LLM_TENSOR_LOOP_MSG_QUERY, "weight", il), {n_embd, LOOP_CTRL_COUNT}, 0);
++        for (int c = 0; c < LOOP_CTRL_COUNT; ++c) {
++            l.ctrl_down[c]   = create_tensor(tn(down[c],   "weight", il), {2*n_embd, rank}, 0);
++            l.ctrl_gain[c]   = create_tensor(tn(gain[c],   "weight", il), {rank, n_embd}, 0);
++            l.ctrl_forget[c] = create_tensor(tn(forget[c], "weight", il), {rank, n_embd}, 0);
++        }
++    }
++
++    // share the physical weights, each cache slot keeps its own KV and conv state
++    for (int il = n_phys; il < (int) hparams.n_layer(); ++il) {
++        layers[il] = layers[layer_phys(il)];
++    }
++}
++
++std::unique_ptr<llm_graph_context> llama_model_inkling2_loop::build_arch_graph(const llm_graph_params & params) const {
++    return std::make_unique<graph>(params);
++}
++
++llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama_model_inkling2::graph(params, no_build{}) {
++    const auto & m = static_cast<const llama_model_inkling2_loop &>(model);
++    const int start = m.core_start;
++    const int end   = m.core_end;
++
++    auto * cur = build_inputs();
++    std::vector<ggml_tensor *> blocks;
++
++    // DSpark target features are indexed by layer visit, not by cache slot
++    int visit = 0;
++
++    for (int il = 0; il < start; ++il) {
++        res->t_layer_inp[visit++] = cur;
++        cur = build_layer(il, il, cur, blocks);
++    }
++
++    // every pass starts from the prelude output
++    auto * prelude = cur;
++    const auto prelude_blocks = blocks;
++    for (uint32_t pass = 0; pass < m.n_passes; ++pass) {
++        // the bank of the previous pass: its blocks after the first core block, and its output
++        std::vector<ggml_tensor *> bank;
++        ggml_tensor * bank_out = nullptr;
++        if (pass > 0) {
++            bank.assign(blocks.begin() + prelude_blocks.size() + 1, blocks.end());
++            bank_out = cur;
++            cur = prelude;
++            blocks = prelude_blocks;
++        }
++        for (int ip = start; ip < end; ++ip) {
++            const int il = pass == 0 ? ip : m.n_phys + (pass - 1)*(end - start) + (ip - start);
++            res->t_layer_inp[visit++] = cur;
++            if (pass == 0) {
++                cur = build_layer(il, ip, cur, blocks);
++                continue;
++            }
++            const auto & loop = m.loop_layers[ip - start];
++            cur = build_layer(il, ip, cur, blocks, mix(bank, bank_out, loop.msg_query), &loop);
++        }
++    }
++
++    for (int il = end; il < m.n_phys; ++il) {
++        res->t_layer_inp[visit++] = cur;
++        cur = build_layer(il, il, cur, blocks);
++    }
++    GGML_ASSERT(visit == n_layer);
++    build_output(cur, blocks);
++}
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index ca25c1d53..29c552f9c 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -100,7 +100,7 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
+     output_norm      = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,      "weight"), {n_embd}, 0);
+     output_res_query = create_tensor(tn(LLM_TENSOR_OUTPUT_RES_QUERY, "weight"), {n_embd}, 0);
+ 
+-    for (int i = 0; i < n_layer; ++i) {
++    for (int i = 0; i < n_layer_phys(); ++i) {
+         auto & layer = layers[i];
+ 
+         const int64_t n_head      = hparams.n_head(i);
+@@ -236,16 +236,27 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
+     return ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1));
+ }
+ 
+-llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {
+-    auto * inp  = build_inp_mem_hybrid_iswa_rel(hparams.n_relative_extent, hparams.n_swa);
+-    auto * attn = inp->get_attn();
+-    auto * recr = inp->get_recr();
++// mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
++ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl) {
++    ggml_tensor * gate = ggml_concat(ctx0, ggml_rms_norm(ctx0, cur, 1e-6f), ggml_rms_norm(ctx0, message, 1e-6f), 0);
++    gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
++
++    ggml_tensor * gain   = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_gain[ctrl],   gate));
++    ggml_tensor * forget = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_forget[ctrl], gate));
++
++    return ggml_add(ctx0, ggml_sub(ctx0, cur, ggml_mul(ctx0, forget, cur)), ggml_mul(ctx0, gain, message));
++}
++
++ggml_tensor * llama_model_inkling2::graph::build_inputs() {
++    inp  = build_inp_mem_hybrid_iswa_rel(hparams.n_relative_extent, hparams.n_swa);
++    attn = inp->get_attn();
++    recr = inp->get_recr();
+ 
+-    ggml_tensor * inp_pos     = build_inp_pos();
+-    ggml_tensor * inp_out_ids = build_inp_out_ids();
++    ggml_tensor * inp_pos = build_inp_pos();
++    inp_out_ids = build_inp_out_ids();
+ 
+     // log-scaled positions: 1 + alpha*log(max(1, (pos + 1)/floor)), multiplies q and r of the full-attention layers
+-    ggml_tensor * tau = ggml_scale_bias(ctx0, ggml_cast(ctx0, inp_pos, GGML_TYPE_F32), 1.0f, 1.0f);
++    tau = ggml_scale_bias(ctx0, ggml_cast(ctx0, inp_pos, GGML_TYPE_F32), 1.0f, 1.0f);
+     tau = ggml_log(ctx0, ggml_clamp(ctx0, ggml_scale(ctx0, tau, 1.0f/hparams.n_log_scale_floor), 1.0f, INFINITY));
+     tau = ggml_reshape_3d(ctx0, ggml_scale_bias(ctx0, tau, hparams.f_log_scale_alpha, 1.0f), 1, 1, n_tokens);
+ 
+@@ -256,137 +267,166 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
+         cur = build_norm(cur, model.tok_norm, nullptr, LLM_NORM_RMS, -1);
+     }
+ 
+-    std::vector<ggml_tensor *> blocks;
++    return cur;
++}
+ 
+-    for (int il = 0; il < n_layer; ++il) {
+-        const auto & layer = model.layers[il];
+-
+-        const bool    is_swa       = hparams.is_swa(il);
+-        const int64_t n_head       = hparams.n_head(il);
+-        const int64_t n_head_kv    = hparams.n_head_kv(il);
+-        const int64_t n_embd_head  = hparams.n_embd_head_k(il);
+-        const int64_t n_embd_k_gqa = n_embd_head*n_head_kv;
+-
+-        ggml_tensor * state   = recr->mctx->get_r_l(il);
+-        ggml_tensor * history = build_rs(recr, state, hparams.n_embd_r(), ubatch.n_seqs);
+-        history = ggml_reshape_3d(ctx0, history, hparams.n_shortconv_l_cache - 1, hparams.n_sconv_channels, ubatch.n_seqs);
+-
+-        ggml_tensor * inpSA = cur;
+-
+-        // attention inputs: SWA layers mix one, full-attention layers one each for Q, K and V
+-        ggml_tensor * inputs[3] = {cur, cur, cur};
+-        if (layer.attn_res_query) {
+-            ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
+-            for (int j = 0; j < 3; ++j) {
+-                inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
+-            }
+-        }
++ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
++        ggml_tensor * messages, const loop_layer * loop) {
++    GGML_ASSERT(!messages == !loop);
+ 
+-        if (is_swa) {
+-            inputs[0] = build_norm(inputs[0], layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+-            inputs[1] = inputs[2] = inputs[0];
+-        } else {
+-            inputs[0] = build_norm(inputs[0], layer.attn_q_inp_norm, nullptr, LLM_NORM_RMS, il);
+-            inputs[1] = build_norm(inputs[1], layer.attn_k_inp_norm, nullptr, LLM_NORM_RMS, il);
+-            inputs[2] = build_norm(inputs[2], layer.attn_v_inp_norm, nullptr, LLM_NORM_RMS, il);
++    const auto & layer = model.layers[il];
++
++    const bool    is_swa       = hparams.is_swa(il);
++    const int64_t n_head       = hparams.n_head(il);
++    const int64_t n_head_kv    = hparams.n_head_kv(il);
++    const int64_t n_embd_head  = hparams.n_embd_head_k(il);
++    const int64_t n_embd_k_gqa = n_embd_head*n_head_kv;
++
++    // the message of controller ctrl, [n_embd, n_tokens]
++    auto message = [&](int ctrl) {
++        return ggml_cont(ctx0, ggml_view_2d(ctx0, messages, n_embd, n_tokens, messages->nb[2], ctrl*messages->nb[1]));
++    };
++
++    ggml_tensor * state   = recr->mctx->get_r_l(il);
++    ggml_tensor * history = build_rs(recr, state, hparams.n_embd_r(), ubatch.n_seqs);
++    history = ggml_reshape_3d(ctx0, history, hparams.n_shortconv_l_cache - 1, hparams.n_sconv_channels, ubatch.n_seqs);
++
++    ggml_tensor * inpSA = cur;
++
++    // attention inputs: SWA layers mix one, full-attention layers one each for Q, K and V
++    ggml_tensor * inputs[3] = {cur, cur, cur};
++    if (layer.attn_res_query) {
++        ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
++        for (int j = 0; j < 3; ++j) {
++            inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
+         }
++    }
+ 
+-        // self-attention
+-        {
+-            ggml_tensor * Qcur = build_lora_mm(layer.wq, inputs[0]);
+-            ggml_tensor * Kcur = convolve(build_lora_mm(layer.wk, inputs[1]), layer.attn_k_conv,
+-                    is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]), state, history, recr, 0);
+-            ggml_tensor * Vcur = convolve(build_lora_mm(layer.wv, inputs[2]), layer.attn_v_conv,
+-                    is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]), state, history, recr, n_embd_k_gqa);
+-            ggml_tensor * Rcur = build_lora_mm(layer.attn_rel, inputs[0]);
++    if (messages) {
++        // the messages make the Q, K and V inputs of a SWA layer differ
++        for (int j = 0; j < 3; ++j) {
++            inputs[j] = control(inputs[j], message(LOOP_CTRL_Q + j), *loop, LOOP_CTRL_Q + j);
++        }
++    }
+ 
+-            Qcur = clip(ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), layer.attn_q_clip, hparams.f_qk_clip);
+-            Kcur = clip(ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), nullptr,           hparams.f_qk_clip);
+-            Vcur = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens), hparams.f_norm_rms_eps);
+-            Rcur = clip(ggml_reshape_3d(ctx0, Rcur, hparams.n_relative, n_head, n_tokens), layer.attn_rel_clip, hparams.f_relative_clip);
++    if (is_swa && messages) {
++        for (int j = 0; j < 3; ++j) {
++            inputs[j] = build_norm(inputs[j], layer.attn_norm, nullptr, LLM_NORM_RMS, il);
++        }
++    } else if (is_swa) {
++        inputs[0] = build_norm(inputs[0], layer.attn_norm, nullptr, LLM_NORM_RMS, il);
++        inputs[1] = inputs[2] = inputs[0];
++    } else {
++        inputs[0] = build_norm(inputs[0], layer.attn_q_inp_norm, nullptr, LLM_NORM_RMS, il);
++        inputs[1] = build_norm(inputs[1], layer.attn_k_inp_norm, nullptr, LLM_NORM_RMS, il);
++        inputs[2] = build_norm(inputs[2], layer.attn_v_inp_norm, nullptr, LLM_NORM_RMS, il);
++    }
+ 
+-            if (!is_swa) {
+-                Qcur = ggml_mul(ctx0, Qcur, tau);
+-                Rcur = ggml_mul(ctx0, Rcur, tau);
+-            }
++    // self-attention
++    {
++        ggml_tensor * Qcur = build_lora_mm(layer.wq, inputs[0]);
++        ggml_tensor * Kcur = convolve(build_lora_mm(layer.wk, inputs[1]), layer.attn_k_conv,
++                is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]), state, history, recr, 0);
++        ggml_tensor * Vcur = convolve(build_lora_mm(layer.wv, inputs[2]), layer.attn_v_conv,
++                is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]), state, history, recr, n_embd_k_gqa);
++        ggml_tensor * Rcur = build_lora_mm(layer.attn_rel, inputs[0]);
++
++        Qcur = clip(ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), layer.attn_q_clip, hparams.f_qk_clip);
++        Kcur = clip(ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), nullptr,           hparams.f_qk_clip);
++        Vcur = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens), hparams.f_norm_rms_eps);
++        Rcur = clip(ggml_reshape_3d(ctx0, Rcur, hparams.n_relative, n_head, n_tokens), layer.attn_rel_clip, hparams.f_relative_clip);
++
++        if (!is_swa) {
++            Qcur = ggml_mul(ctx0, Qcur, tau);
++            Rcur = ggml_mul(ctx0, Rcur, tau);
++        }
+ 
+-            cb(Qcur, "Qcur", il);
+-            cb(Kcur, "Kcur", il);
+-            cb(Vcur, "Vcur", il);
+-            cb(Rcur, "Rcur", il);
++        cb(Qcur, "Qcur", il);
++        cb(Kcur, "Kcur", il);
++        cb(Vcur, "Vcur", il);
++        cb(Rcur, "Rcur", il);
+ 
+-            ggml_tensor * rel_pos = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
++        ggml_tensor * rel_pos = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
+ 
+-            const int64_t n_stream = (is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3];
+-            const int64_t n_kv     = rel_pos->ne[0];
++        const int64_t n_stream = (is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3];
++        const int64_t n_kv     = rel_pos->ne[0];
+ 
+-            ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
++        ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
+ 
+-            // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
+-            ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
++        // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
++        ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
+ 
+-            // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
+-            table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
+-            table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
++        // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
++        table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
++        table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
+ 
+-            ggml_tensor * kq_b = ggml_get_rows(ctx0, table, rel_pos);
+-            kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
+-            kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
+-            cb(kq_b, "kq_b", il);
++        ggml_tensor * kq_b = ggml_get_rows(ctx0, table, rel_pos);
++        kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
++        kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
++        cb(kq_b, "kq_b", il);
+ 
+-            sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
++        sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+ 
+-            cur = build_attn(inp,
+-                    nullptr, nullptr, nullptr,
+-                    Qcur, Kcur, Vcur, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il);
++        cur = build_attn(inp,
++                nullptr, nullptr, nullptr,
++                Qcur, Kcur, Vcur, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il);
+ 
+-            cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
+-            cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
+-            cb(cur, "attn_out", il);
+-        }
++        cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
++        cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
++        cb(cur, "attn_out", il);
++    }
+ 
+-        // the first layer of each block starts a new residual stream, the earlier one joins the mixed blocks
+-        if (il % hparams.attn_res_block_size == 0) {
+-            blocks.push_back(inpSA);
+-        } else {
+-            cur = ggml_add(ctx0, inpSA, cur);
+-        }
++    // the first layer of each block starts a new residual stream, the earlier one joins the mixed blocks
++    if (ip % hparams.attn_res_block_size == 0) {
++        blocks.push_back(inpSA);
++    } else {
++        cur = ggml_add(ctx0, inpSA, cur);
++    }
+ 
+-        ggml_tensor * ffn_inp = cur;
+-        cb(ffn_inp, "ffn_inp", il);
++    ggml_tensor * ffn_inp = cur;
++    cb(ffn_inp, "ffn_inp", il);
+ 
+-        // MoE
+-        cur = ggml_reshape_2d(ctx0, mix(blocks, cur, layer.ffn_res_query), n_embd, n_tokens);
+-        cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+-
+-        cur = build_moe_ffn(cur,
+-                layer.ffn_gate_inp,
+-                nullptr,
+-                nullptr,
+-                layer.ffn_down_exps,
+-                layer.ffn_exp_probs_b,
+-                hparams.n_expert,
+-                hparams.n_expert_used(il),
+-                LLM_FFN_SITU, true,
+-                hparams.expert_weights_scale,
+-                LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID,
+-                il,
+-                nullptr,
+-                layer.ffn_gate_up_exps,
+-                layer.ffn_up_exps_s,
+-                layer.ffn_gate_exps_s,
+-                layer.ffn_down_exps_s);
+-
+-        cur = convolve(cur, layer.ffn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa + n_embd);
+-        cb(cur, "ffn_out", il);
+-
+-        cur = ggml_add(ctx0, ffn_inp, cur);
+-        cb(cur, "l_out", il);
++    // MoE
++    cur = ggml_reshape_2d(ctx0, mix(blocks, cur, layer.ffn_res_query), n_embd, n_tokens);
++    if (messages) {
++        cur = control(cur, message(LOOP_CTRL_FFN), *loop, LOOP_CTRL_FFN);
+     }
++    cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
++
++    cur = build_moe_ffn(cur,
++            layer.ffn_gate_inp,
++            nullptr,
++            nullptr,
++            layer.ffn_down_exps,
++            layer.ffn_exp_probs_b,
++            hparams.n_expert,
++            hparams.n_expert_used(il),
++            LLM_FFN_SITU, true,
++            hparams.expert_weights_scale,
++            LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID,
++            il,
++            nullptr,
++            layer.ffn_gate_up_exps,
++            layer.ffn_up_exps_s,
++            layer.ffn_gate_exps_s,
++            layer.ffn_down_exps_s);
++
++    cur = convolve(cur, layer.ffn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa + n_embd);
++    cb(cur, "ffn_out", il);
++
++    cur = ggml_add(ctx0, ffn_inp, cur);
++    cb(cur, "l_out", il);
++
++    return cur;
++}
+ 
++void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks) {
+     cur = ggml_reshape_2d(ctx0, mix(blocks, cur, model.output_res_query), n_embd, n_tokens);
+     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+ 
++    // DSpark target features: the last one is the final norm output of every token
++    res->t_layer_inp[n_layer] = cur;
++
+     if (inp_out_ids) {
+         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+     }
+@@ -410,3 +450,16 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
+     cb(cur, "result_output", -1);
+     res->t_logits = cur;
+ }
++
++llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {
++    ggml_tensor * cur = build_inputs();
++
++    std::vector<ggml_tensor *> blocks;
++    for (int il = 0; il < n_layer; ++il) {
++        // DSpark target features: the partial block at the layer input
++        res->t_layer_inp[il] = cur;
++        cur = build_layer(il, il, cur, blocks);
++    }
++
++    build_output(cur, blocks);
++}
+diff --git a/src/models/models.h b/src/models/models.h
+index 72b6129cb..f5ff9fe41 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -1646,6 +1646,8 @@ struct llama_model_dflash : public llama_model_base {
+         graph_base(const llm_graph_params & params);
+ 
+         ggml_tensor * build_inject();
++        void          build_inject_ctx_mix();
++        void          store_inject_kv(ggml_tensor * Kcur, ggml_tensor * Vcur, int il);
+         ggml_tensor * build_inp_tokens();
+         ggml_tensor * build_layers(ggml_tensor * inp_tokens);
+         ggml_tensor * build_logits(ggml_tensor * cur);
+@@ -1690,6 +1692,9 @@ struct llama_model_dflash : public llama_model_base {
+     // DFlash2 local conv, run by the base layers of DFlash2 and LiliCorr drafts
+     static ggml_tensor * build_dflash2_conv(llm_graph_context & g, ggml_tensor * hidden, ggml_tensor * dynamic, ggml_tensor * base, int side);
+ 
++    // DSpark block input from mask_embd, run by the base layers and the Mistral Large 4 graph
++    static ggml_tensor * build_dspark_inp_block(const llm_graph_context & g, const llama_model & model, ggml_tensor * inp_tokens);
++
+     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+ };
+ 
+@@ -2507,6 +2512,19 @@ struct llama_model_inkling2 : public llama_model_base {
+     void load_arch_tensors(llama_model_loader & ml) override;
+     uint32_t graph_nodes_per_tensor() const override { return 32; }
+ 
++    // the layers stored in the file
++    virtual int n_layer_phys() const { return hparams.n_layer(); }
++
++    // message controllers of the q, k, v and ffn inputs of a looped layer (inkling2_loop)
++    enum { LOOP_CTRL_Q, LOOP_CTRL_K, LOOP_CTRL_V, LOOP_CTRL_FFN, LOOP_CTRL_COUNT };
++
++    struct loop_layer {
++        ggml_tensor * msg_query = nullptr;
++        ggml_tensor * ctrl_down[LOOP_CTRL_COUNT]   = {};
++        ggml_tensor * ctrl_gain[LOOP_CTRL_COUNT]   = {};
++        ggml_tensor * ctrl_forget[LOOP_CTRL_COUNT] = {};
++    };
++
+     struct graph : public llm_graph_context {
+         graph(const llm_graph_params & params);
+         ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
+@@ -2519,6 +2537,52 @@ struct llama_model_inkling2 : public llama_model_base {
+                 ggml_tensor * history,
+                 llm_graph_input_rs * inp,
+                 int64_t offset);
++        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl);
++
++    protected:
++        // the helpers alone, a derived graph builds its own body
++        struct no_build {};
++        graph(const llm_graph_params & params, no_build) : llm_graph_context(params) {}
++
++        // the inputs and the token embeddings
++        ggml_tensor * build_inputs();
++        // cache slot il of physical layer ip; messages [n_embd, LOOP_CTRL_COUNT, n_tokens] are mixed into its inputs
++        ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
++                ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr);
++        void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
++
++        llm_graph_input_mem_hybrid_iswa_rel * inp  = nullptr;
++        llm_graph_input_attn_kv_iswa        * attn = nullptr;
++        llm_graph_input_rs                  * recr = nullptr;
++
++        ggml_tensor * inp_out_ids = nullptr;
++        ggml_tensor * tau         = nullptr; // log-scaled positions
++    };
++
++    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
++};
++
++// the cache slots after the physical layers repeat the core [core_start, core_end) for each later pass
++struct llama_model_inkling2_loop : public llama_model_inkling2 {
++    llama_model_inkling2_loop(const struct llama_model_params & params) : llama_model_inkling2(params) {}
++    void load_arch_hparams(llama_model_loader & ml) override;
++    void load_arch_tensors(llama_model_loader & ml) override;
++
++    int n_layer_phys() const override { return n_phys; }
++    int layer_phys(int il) const;
++
++    int      n_phys     = 0;
++    uint32_t core_start = 0;
++    uint32_t core_end   = 0;
++    uint32_t n_passes   = 0;
++    uint32_t gate_rank  = 0;
++    bool     varying    = false; // trained for a varying number of passes
++
++    // indexed by physical layer - core_start
++    std::vector<loop_layer> loop_layers;
++
++    struct graph : public llama_model_inkling2::graph {
++        graph(const llm_graph_params & params);
+     };
+ 
+     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
+index 076373427..f433486e8 100644
+--- a/tests/test-llama-archs.cpp
++++ b/tests/test-llama-archs.cpp
+@@ -343,7 +343,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const
+         n_vocab = 3072; // TODO: should be 4096, but user code cannot get `n_vocab_out` yet [TAG_LLAMA_N_VOCAB_OUT]
+     } else if (arch == LLM_ARCH_HRM_TEXT) {
+         n_layer = 6; // 1 layer per stack x 2 h-cycles x (2 l-cycles + 1) cache slots
+-    } else if (arch == LLM_ARCH_INKLING2) {
++    } else if (arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) {
+         n_embd  = 128;
+         n_head  = 4;
+         n_ff    = 24;
+@@ -720,7 +720,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const
+         ms.add_kv(LLM_KV_MUDD_TAP_INDICES,            std::vector<int32_t>({-1, -1, -1, -1, 0, 2, 1, 3}));
+     }
+ 
+-    if (arch == LLM_ARCH_INKLING2) {
++    if (arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) {
++        const bool loop = arch == LLM_ARCH_INKLING2_LOOP;
+         ms.add_kv(LLM_KV_ATTENTION_RELATIVE_LENGTH,   uint32_t(4));
+         ms.add_kv(LLM_KV_ATTENTION_RELATIVE_EXTENT,   uint32_t(16));
+         ms.add_kv(LLM_KV_ATTENTION_QK_CLIP,           0.25f);
+@@ -728,6 +729,14 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const
+         ms.add_kv(LLM_KV_ATTENTION_LOG_SCALE_FLOOR,   uint32_t(4));
+         ms.add_kv(LLM_KV_ATTENTION_LOG_SCALE_ALPHA,   0.1f);
+         ms.add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,         uint32_t(2));
++        if (loop) {
++            // prelude 0, core 1, coda 2; the loader adds slot 3 for the second pass over the core
++            ms.add_kv(LLM_KV_LOOP_START,     uint32_t(1));
++            ms.add_kv(LLM_KV_LOOP_END,       uint32_t(2));
++            ms.add_kv(LLM_KV_LOOP_COUNT,     uint32_t(2));
++            ms.add_kv(LLM_KV_LOOP_GATE_RANK, uint32_t(8));
++            ms.add_kv(LLM_KV_LOOP_VARYING,   false);
++        }
+         ms.add_kv(LLM_KV_SHORTCONV_L_CACHE,           uint32_t(4));
+         ms.add_kv(LLM_KV_VOCAB_SIZE,                  n_vocab + 2);
+         ms.add_kv(LLM_KV_VOCAB_SIZE_UNPADDED,         n_vocab);
+@@ -844,7 +853,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const
+     ms.add_kv(LLM_KV_WKV_HEAD_SIZE,               n_embd/n_head);
+     ms.add_kv(LLM_KV_SHORTCONV_L_CACHE,           uint32_t(3));
+     ms.add_kv(LLM_KV_RESIDUAL_SCALE,              3.5565588200778455f);
+-    ms.add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,         uint32_t(12));
++    // the inkling2_loop core boundaries must be multiples of the block size
++    ms.add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,         uint32_t(arch == LLM_ARCH_INKLING2_LOOP ? 1 : 12));
+     ms.add_kv(LLM_KV_ACTIVATION_SITU_BETA,        4.0f);
+     ms.add_kv(LLM_KV_ACTIVATION_SITU_LINEAR_BETA, 25.0f);
+     ms.add_kv(LLM_KV_KDA_GATE_LOWER_BOUND,        -5.0f);
+@@ -1206,6 +1216,7 @@ static bool moe_mandatory(const llm_arch arch) {
+         case LLM_ARCH_METIS16:
+         case LLM_ARCH_ZONOS3:
+         case LLM_ARCH_INKLING2:
++        case LLM_ARCH_INKLING2_LOOP:
+             return true;
+         default:
+             return false;

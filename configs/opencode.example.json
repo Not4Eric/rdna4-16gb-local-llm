@@ -1,0 +1,44 @@
+{
+  "provider": {
+    "llamacpp": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "llama.cpp (Qwen 3.8 27B)",
+      "options": {
+        "baseURL": "http://127.0.0.1:8081/v1",
+        "apiKey": "local"
+      },
+      "models": {
+        "qwen38-27b": {
+          "name": "Qwen3.8-27B IQ3_S (128k, MTP+n-gram)",
+          "tool_call": true,
+          "reasoning": true,
+          "limit": {
+            "context": 131072,
+            "input": 118784,
+            "output": 16384
+          }
+        }
+      }
+    },
+    "inkling2": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "llama.cpp (Inkling 2 Mini)",
+      "options": {
+        "baseURL": "http://127.0.0.1:8082/v1",
+        "apiKey": "local"
+      },
+      "models": {
+        "inkling2-mini": {
+          "name": "Inkling 2 Mini IQ3_S (128k, DSpark+n-gram)",
+          "tool_call": true,
+          "reasoning": true,
+          "limit": {
+            "context": 131072,
+            "input": 118784,
+            "output": 16384
+          }
+        }
+      }
+    }
+  }
+}

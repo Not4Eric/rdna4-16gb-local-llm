@@ -1,0 +1,38 @@
+{
+  "name": "inkling2-mini-128k",
+  "role": "Best single-stream 128k config for Inkling 2 Mini GSQ-RCO IQ3_S on RX 9070 XT 16 GB: native 3-layer DSpark ISTA Q8_0 drafter (n_max=3, probabilistic, 4096 draft KV window) + ngram-mod, 100% VRAM-resident 128k q4_0 KV cache (zero PCIe spill), -ub 128, -lm dio",
+  "engine": {
+    "llama_cpp_commit": "919794500",
+    "rdna_boosts_tag": "v18-919794500-r359",
+    "rdna_boosts_commit": "a0e7e62b9dc748ecfe1902101084c46c244748fe",
+    "llama_cpp_overdoing_commit": "1ec4b8c4858052afc4803aaabaf2fde69c35688c",
+    "local_patches": [
+      "patches/0001-inkling2-and-dspark.patch",
+      "patches/0002-inkling2-f16-kqb-inplace.patch"
+    ],
+    "target_gpu": "gfx1201 (AMD Radeon RX 9070 XT 16 GB)"
+  },
+  "weights": {
+    "model_repo": "ISTA-DASLab/Inkling-2-Mini-GSQ-RCO-GGUF",
+    "model_file": "Inkling-2-Mini-GSQ-RCO-IQ3_S.gguf",
+    "draft_file": "dspark-Inkling-2-Mini-Q8_0-ista.gguf"
+  },
+  "port": 8082,
+  "results": {
+    "baseline_no_spec_decode_tok_s": 35.66,
+    "decode_short_median_tok_s": 52.67,
+    "decode_short_control_range_tok_s": [52.3, 54.87],
+    "decode_short_code_peak_tok_s": 68.39,
+    "decode_119k_tok_s": [36.33, 46.14, 41.03],
+    "prefill_4985_tok_s": 666.7,
+    "prefill_38880_tok_s": 461.0,
+    "prefill_118955_tok_s": 269.7,
+    "ttft_119k_cold_s": 441.4,
+    "ttft_119k_warm_s": 1.4,
+    "needle_119k": "3/3 at 118,955 tokens (91% of 128k)",
+    "determinism_temp0": "6/6 byte-identical run-to-run",
+    "vram_peak_gib": 14.8,
+    "vram_free_gib": 1.12,
+    "startup_cold_s": 5.1
+  }
+}

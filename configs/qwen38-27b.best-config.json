@@ -1,0 +1,34 @@
+{
+  "name": "qwen38-27b-128k",
+  "role": "Best single-stream 128k config for Qwen 3.8 27B IQ3_S (full 248,320 vocab) with Safasfly self-distilled MTP1 blk.64.* head on llama-frankenstein (rdna-boosts v18-r359 + J1-J7), fused q4_0 KV fold, 77,824-cell VRAM KV window, mmvk + int2 draft head + GPU step loop + K1/F8/WMMA prefill",
+  "engine": {
+    "llama_cpp_commit": "919794500",
+    "rdna_boosts_tag": "v18-919794500-r359",
+    "rdna_boosts_commit": "a0e7e62b9dc748ecfe1902101084c46c244748fe",
+    "llama_cpp_overdoing_commit": "1ec4b8c4858052afc4803aaabaf2fde69c35688c",
+    "target_gpu": "gfx1201 (AMD Radeon RX 9070 XT 16 GB)"
+  },
+  "weights": {
+    "base_repo": "jegreene/Swift-1.5-Qwen3.8-27B-heretic-GSQ-RCO-GGUF",
+    "base_file": "Swift-1.5-Qwen3.8-27B-heretic-GSQ-RCO-IQ3_S-mtp.gguf",
+    "mtp1_donor_repo": "Safasfly/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_S-P2-MTP1-GGUF",
+    "output_file": "Swift-1.5-Qwen3.8-27B-heretic-GSQ-RCO-IQ3_S-mtp1.gguf"
+  },
+  "port": 8081,
+  "results": {
+    "baseline_no_spec_decode_tok_s": 34.12,
+    "decode_short_median_tok_s": 82.53,
+    "decode_short_median_w74k_tok_s": 80.5,
+    "decode_short_peak_tok_s": 108.72,
+    "decode_100k_tok_s": [42.53, 50.86, 61.37],
+    "prefill_4k_tok_s": 1641.7,
+    "prefill_32k_tok_s": 1400.5,
+    "prefill_100k_tok_s": 946.0,
+    "ttft_100k_cold_s": 105.6,
+    "ttft_100k_warm_s": 3.0,
+    "needle_100k": "3/3 (7/7 across 3 reps)",
+    "vram_peak_gib": 14.93,
+    "vram_free_gib": 0.99,
+    "startup_cold_s": 6.0
+  }
+}
